@@ -1,0 +1,139 @@
+# OTT Clouds CI/CD Runner
+
+Hệ thống này chạy bằng terminal qua script `./run`.
+Nó sẽ kiểm tra nhánh Git (mặc định `main`) của repo `ottclouds-android` có PR mới được merge chưa. Nếu có, hệ thống sẽ build APK và distribute APK lên Firebase App Distribution.
+
+## System Diagram (English)
+
+```mermaid
+flowchart TD
+    A["Run ./run"] --> B["Load configuration files and CLI flags"]
+    B --> C["Read latest merged PR on target branch from GitHub API"]
+    C --> D{"Is there a new merged PR?"}
+    D -- "No" --> E["Stop (no deployment)"]
+    D -- "Yes" --> F["Run BUILD_COMMAND in ottclouds-android repo"]
+    F --> G["Find APK files in app-mobile and app-tv output folders"]
+    G --> H["Upload APKs to Firebase App Distribution"]
+    H --> I["Save processed PR metadata in .state/<branch>.json"]
+```
+
+## Cấu trúc thư mục
+
+- `run`: entrypoint chính để chạy pipeline.
+- `config/default.env`: config mặc định của hệ thống.
+- `.env.example`: mẫu biến môi trường để copy thành `.env`.
+- `.state/`: lưu trạng thái PR đã xử lý (tự tạo khi chạy).
+- `.gitignore`: bỏ qua `.env` và `.state`.
+- `docs/system-diagram.md`: sơ đồ kiến trúc (English).
+
+## Chuẩn bị môi trường
+
+1. Cài các tool cần thiết:
+- `git`
+- `curl`
+- `jq`
+- `firebase` CLI (`npm i -g firebase-tools`)
+
+2. Đảm bảo repo Android tồn tại ở:
+- `../ottclouds-android` (mặc định)
+
+3. Tạo file cấu hình local:
+
+```bash
+cp .env.example .env
+```
+
+4. Điền các biến bắt buộc trong `.env`:
+- `GITHUB_TOKEN` (khuyến nghị mạnh, gần như bắt buộc nếu repo private)
+- `FIREBASE_APP_ID_MOBILE`
+- `FIREBASE_APP_ID_TV`
+- `FIREBASE_TOKEN` hoặc `GOOGLE_APPLICATION_CREDENTIALS`
+
+## Cách chạy
+
+Chạy mặc định:
+
+```bash
+./run
+```
+
+Chạy với nhánh khác:
+
+```bash
+./run --branch release/1.2.0
+```
+
+Buộc build và distribute (bỏ qua check PR mới):
+
+```bash
+./run --force-build
+```
+
+Chế độ kiểm tra (không build/distribute thật):
+
+```bash
+./run --dry-run --print-config
+```
+
+Nạp thêm một file config bổ sung:
+
+```bash
+./run --config ./config/staging.env
+```
+
+## Cơ chế check PR merge
+
+- Script gọi GitHub API lấy danh sách PR closed theo `DEPLOY_GIT_BRANCH`.
+- Lọc các PR có `merged_at != null`.
+- So sánh PR mới nhất với state cũ trong `.state/<branch>.json`.
+- Nếu không có PR merge mới: dừng.
+- Nếu có PR merge mới: build + upload Firebase + cập nhật state.
+
+## Biến môi trường
+
+Các biến dưới đây có thể đặt trong `.env` để override `config/default.env`.
+
+| Variable | Required | Default | Mô tả |
+|---|---|---|---|
+| `ANDROID_REPO_PATH` | No | `../ottclouds-android` | Đường dẫn tới repo Android |
+| `DEPLOY_GIT_BRANCH` | No | `main` | Nhánh để theo dõi PR merge |
+| `GITHUB_API_URL` | No | `https://api.github.com` | GitHub API base URL |
+| `MAX_PULLS_TO_SCAN` | No | `100` | Số PR closed tối đa để scan mỗi lần chạy |
+| `GITHUB_OWNER` | No | auto-detect | Chủ repo GitHub, tự detect từ `origin` nếu bỏ trống |
+| `GITHUB_REPO` | No | auto-detect | Tên repo GitHub, tự detect từ `origin` nếu bỏ trống |
+| `GITHUB_TOKEN` | Yes* | empty | Token GitHub để đọc PR (bắt buộc cho repo private) |
+| `STATE_DIR` | No | `.state` | Thư mục lưu state PR đã xử lý |
+| `BUILD_COMMAND` | No | Gradle command mẫu | Lệnh build chạy trong `ANDROID_REPO_PATH` |
+| `MOBILE_APK_OUTPUT_DIR` | No | `app-mobile/build/outputs/apk` | Folder chứa APK mobile |
+| `TV_APK_OUTPUT_DIR` | No | `app-tv/build/outputs/apk` | Folder chứa APK TV |
+| `ENABLE_MOBILE_DISTRIBUTION` | No | `true` | Bật/tắt upload mobile APK |
+| `ENABLE_TV_DISTRIBUTION` | No | `true` | Bật/tắt upload TV APK |
+| `FAIL_IF_APK_NOT_FOUND` | No | `true` | Fail nếu không tìm thấy APK |
+| `ALLOW_STALE_APK_FALLBACK` | No | `true` | Nếu không có APK mới sau build marker thì lấy toàn bộ APK hiện có |
+| `FIREBASE_CLI_BIN` | No | `firebase` | Tên binary Firebase CLI |
+| `FIREBASE_APP_ID_MOBILE` | Yes** | empty | Firebase App ID cho app mobile |
+| `FIREBASE_APP_ID_TV` | Yes** | empty | Firebase App ID cho app TV |
+| `FIREBASE_GROUPS_MOBILE` | No | empty | Danh sách group mobile (comma-separated) |
+| `FIREBASE_GROUPS_TV` | No | empty | Danh sách group TV (comma-separated) |
+| `FIREBASE_TESTERS_MOBILE` | No | empty | Danh sách email testers mobile |
+| `FIREBASE_TESTERS_TV` | No | empty | Danh sách email testers TV |
+| `FIREBASE_RELEASE_NOTES` | No | auto-generated | Release notes inline |
+| `FIREBASE_RELEASE_NOTES_FILE` | No | empty | File release notes (ưu tiên cao hơn `FIREBASE_RELEASE_NOTES`) |
+| `FIREBASE_TOKEN` | Yes*** | empty | Token cho Firebase CLI non-interactive |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Yes*** | empty | Service account JSON path cho Firebase auth |
+
+Ghi chú:
+- `Yes*`: bắt buộc nếu repo private hoặc cần tránh rate limit.
+- `Yes**`: bắt buộc khi channel upload tương ứng đang bật.
+- `Yes***`: cần ít nhất một trong hai cách auth Firebase.
+
+## Troubleshooting nhanh
+
+- `GitHub API request failed (401/403/404)`:
+  - Kiểm tra `GITHUB_TOKEN` và quyền truy cập repo.
+- `Missing Firebase app id`:
+  - Điền `FIREBASE_APP_ID_MOBILE`/`FIREBASE_APP_ID_TV`.
+- `No APK files found`:
+  - Kiểm tra `BUILD_COMMAND` và output folders.
+- `Missing required command: firebase`:
+  - Cài Firebase CLI và đảm bảo command `firebase` có trong `$PATH`.
