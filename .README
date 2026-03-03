@@ -1,28 +1,35 @@
 # OTT Clouds CI/CD Runner
 
 Hệ thống này chạy bằng terminal qua script `./run`.
-Nó sẽ kiểm tra nhánh Git (mặc định `main`) của repo `ottclouds-android` có PR mới được merge chưa. Nếu có, hệ thống sẽ build APK và distribute APK lên Firebase App Distribution.
+Nó sẽ theo dõi commit mới trên nhánh Git (mặc định `main`) của repo `ottclouds-android`.
+Khi có commit mới, script đọc tên các nhánh đã merge gần nhất vào `main`:
+- có `app-tv` -> build TV + distribute Firebase
+- có `app-mobile` -> build mobile + distribute Firebase
+- không có cả 2 -> chỉ cập nhật state, không build.
 
 ## System Diagram (English)
 
 ```mermaid
 flowchart TD
     A["Run ./run"] --> B["Load configuration files and CLI flags"]
-    B --> C["Read latest merged PR on target branch from GitHub API"]
-    C --> D{"Is there a new merged PR?"}
-    D -- "No" --> E["Stop (no deployment)"]
-    D -- "Yes" --> F["Run BUILD_COMMAND in ottclouds-android repo"]
-    F --> G["Find APK files in app-mobile and app-tv output folders"]
-    G --> H["Upload APKs to Firebase App Distribution"]
-    H --> I["Save processed PR metadata in .state/<branch>.json"]
+    B --> C["Fetch latest commit on origin/main (or configured branch)"]
+    C --> D{"Has new commit?"}
+    D -- "No" --> E["Wait and check again"]
+    D -- "Yes" --> F["Read merged branch names from merge commits"]
+    F --> G{"Contains app-tv / app-mobile?"}
+    G -- "No" --> H["Update .state and skip build"]
+    G -- "Yes" --> I["Select BUILD_COMMAND_TV / BUILD_COMMAND_MOBILE"]
+    I --> J["Build APKs"]
+    J --> K["Map APK targets to Firebase apps"]
+    K --> L["Distribute APKs to Firebase group/testers"]
+    L --> M["Save processed commit in .state/<branch>.state"]
 ```
 
 ## Cấu trúc thư mục
 
 - `run`: entrypoint chính để chạy pipeline.
-- `config/default.env`: config mặc định của hệ thống.
 - `.env.example`: mẫu biến môi trường để copy thành `.env`.
-- `.state/`: lưu trạng thái PR đã xử lý (tự tạo khi chạy).
+- `.state/`: lưu trạng thái commit đã xử lý (tự tạo khi chạy).
 - `.gitignore`: bỏ qua `.env` và `.state`.
 - `docs/system-diagram.md`: sơ đồ kiến trúc (English).
 
@@ -30,7 +37,6 @@ flowchart TD
 
 1. Cài các tool cần thiết:
 - `git`
-- `curl`
 - `jq`
 - `firebase` CLI (`npm i -g firebase-tools`)
 
@@ -43,11 +49,13 @@ flowchart TD
 cp .env.example .env
 ```
 
-4. Điền các biến bắt buộc trong `.env`:
-- `GITHUB_TOKEN` (khuyến nghị mạnh, gần như bắt buộc nếu repo private)
-- `FIREBASE_APP_ID_MOBILE`
-- `FIREBASE_APP_ID_TV`
-- `FIREBASE_TOKEN` hoặc `GOOGLE_APPLICATION_CREDENTIALS`
+4. Điền các biến quan trọng trong `.env`:
+- `BUILD_COMMAND_TV`
+- `BUILD_COMMAND_MOBILE`
+- `FIREBASE_TARGET_APP_MAP` (khuyến nghị)
+- `GOOGLE_APPLICATION_CREDENTIALS` hoặc đăng nhập `firebase login`
+
+Lưu ý: script chỉ đọc từ `.env`. File `.env.example` chỉ là template tham khảo.
 
 ## Cách chạy
 
@@ -63,7 +71,7 @@ Chạy với nhánh khác:
 ./run --branch release/1.2.0
 ```
 
-Buộc build và distribute (bỏ qua check PR mới):
+Buộc chạy chu kỳ ngay (bỏ qua chờ commit mới):
 
 ```bash
 ./run --force-build
@@ -75,65 +83,91 @@ Chế độ kiểm tra (không build/distribute thật):
 ./run --dry-run --print-config
 ```
 
-Nạp thêm một file config bổ sung:
+Hệ thống chỉ đọc config từ `.env` (không dùng `default.env`).
+
+## Dynamic APK -> Firebase mapping
+
+Script `./run` parse trực tiếp các task `assemble...` từ command đã chọn (TV/mobile) để xác định target build.
+Ví dụ command TV:
 
 ```bash
-./run --config ./config/staging.env
+BUILD_COMMAND_TV="./gradlew :app-tv:assembleVideohubDevRelease :app-tv:assembleSerieshubDevRelease :app-tv:assembleLiveHubDevRelease"
 ```
 
-## Cơ chế check PR merge
+Sẽ detect 3 target:
+- `app-tv:videohub`
+- `app-tv:serieshub`
+- `app-tv:livehub`
 
-- Script gọi GitHub API lấy danh sách PR closed theo `DEPLOY_GIT_BRANCH`.
-- Lọc các PR có `merged_at != null`.
-- So sánh PR mới nhất với state cũ trong `.state/<branch>.json`.
-- Nếu không có PR merge mới: dừng.
-- Nếu có PR merge mới: build + upload Firebase + cập nhật state.
+và tự lấy đúng APK theo từng target trước khi distribute.
+
+Mapping app Firebase dùng biến:
+
+```bash
+FIREBASE_TARGET_APP_MAP="app-tv:videohub=VideoHub Template Tv;app-tv:serieshub=SeriesHub Template Tv;app-tv:livehub=LiveHub Template TV"
+```
+
+Giá trị bên phải có thể là:
+- Firebase `appId` (`1:...:android:...`)
+- hoặc `displayName` lấy từ `firebase apps:list --project <project-id>`
+
+Nếu không map được từ `FIREBASE_TARGET_APP_MAP`, script sẽ fallback:
+1. Các app-id legacy có sẵn trong `.env` (VideoHub/SeriesHub/LiveHub TV, VideoHub mobile)
+2. Auto-discover từ `firebase apps:list --json` theo brand + loại module (tv/mobile)
+
+## Cơ chế check thay đổi nhánh
+
+- Script dùng lệnh `git fetch` + `git rev-parse` để lấy commit mới nhất của `origin/<branch>`.
+- So sánh commit mới nhất với state cũ trong `.state/<branch>.state`.
+- Nếu không có commit mới: chờ rồi check lại.
+- Nếu có commit mới:
+  - đọc tên nhánh merge từ merge commit message
+  - có `app-tv` thì chạy `BUILD_COMMAND_TV`
+  - có `app-mobile` thì chạy `BUILD_COMMAND_MOBILE`
+  - không có từ khóa thì chỉ cập nhật state và bỏ qua build.
 
 ## Biến môi trường
 
-Các biến dưới đây có thể đặt trong `.env` để override `config/default.env`.
+Các biến dưới đây khai báo trong `.env`.
 
 | Variable | Required | Default | Mô tả |
 |---|---|---|---|
 | `ANDROID_REPO_PATH` | No | `../ottclouds-android` | Đường dẫn tới repo Android |
-| `DEPLOY_GIT_BRANCH` | No | `main` | Nhánh để theo dõi PR merge |
-| `GITHUB_API_URL` | No | `https://api.github.com` | GitHub API base URL |
-| `MAX_PULLS_TO_SCAN` | No | `100` | Số PR closed tối đa để scan mỗi lần chạy |
-| `GITHUB_OWNER` | No | auto-detect | Chủ repo GitHub, tự detect từ `origin` nếu bỏ trống |
-| `GITHUB_REPO` | No | auto-detect | Tên repo GitHub, tự detect từ `origin` nếu bỏ trống |
-| `GITHUB_TOKEN` | Yes* | empty | Token GitHub để đọc PR (bắt buộc cho repo private) |
-| `STATE_DIR` | No | `.state` | Thư mục lưu state PR đã xử lý |
-| `BUILD_COMMAND` | No | Gradle command mẫu | Lệnh build chạy trong `ANDROID_REPO_PATH` |
+| `DEPLOY_GIT_BRANCH` | No | `main` | Nhánh theo dõi |
+| `MAX_MERGE_COMMITS_SCAN` | No | `20` | Số merge commits scan khi chưa có state |
+| `STATE_DIR` | No | `.state` | Thư mục lưu state commit đã xử lý |
+| `BUILD_COMMAND_TV` | No | command mẫu TV | Lệnh build TV khi detect keyword `app-tv` |
+| `BUILD_COMMAND_MOBILE` | No | command mẫu mobile | Lệnh build mobile khi detect keyword `app-mobile` |
 | `MOBILE_APK_OUTPUT_DIR` | No | `app-mobile/build/outputs/apk` | Folder chứa APK mobile |
 | `TV_APK_OUTPUT_DIR` | No | `app-tv/build/outputs/apk` | Folder chứa APK TV |
-| `ENABLE_MOBILE_DISTRIBUTION` | No | `true` | Bật/tắt upload mobile APK |
-| `ENABLE_TV_DISTRIBUTION` | No | `true` | Bật/tắt upload TV APK |
 | `FAIL_IF_APK_NOT_FOUND` | No | `true` | Fail nếu không tìm thấy APK |
 | `ALLOW_STALE_APK_FALLBACK` | No | `true` | Nếu không có APK mới sau build marker thì lấy toàn bộ APK hiện có |
+| `ENABLE_DISTRIBUTION` | No | `true` | Bật/tắt distribute Firebase |
+| `ENABLE_MOBILE_DISTRIBUTION` | No | `true` | Bật/tắt distribute target mobile |
+| `ENABLE_VIDEOHUB_TV_DISTRIBUTION` | No | `true` | Bật/tắt distribute VideoHub TV |
+| `ENABLE_SERIESHUB_TV_DISTRIBUTION` | No | `true` | Bật/tắt distribute SeriesHub TV |
+| `ENABLE_LIVEHUB_TV_DISTRIBUTION` | No | `true` | Bật/tắt distribute LiveHub TV |
 | `FIREBASE_CLI_BIN` | No | `firebase` | Tên binary Firebase CLI |
-| `FIREBASE_APP_ID_MOBILE` | Yes** | empty | Firebase App ID cho app mobile |
-| `FIREBASE_APP_ID_TV` | Yes** | empty | Firebase App ID cho app TV |
-| `FIREBASE_GROUPS_MOBILE` | No | empty | Danh sách group mobile (comma-separated) |
-| `FIREBASE_GROUPS_TV` | No | empty | Danh sách group TV (comma-separated) |
-| `FIREBASE_TESTERS_MOBILE` | No | empty | Danh sách email testers mobile |
-| `FIREBASE_TESTERS_TV` | No | empty | Danh sách email testers TV |
+| `FIREBASE_TARGET_APP_MAP` | No | empty | Map target -> Firebase app (`module:brand=appId/displayName`) |
+| `FIREBASE_DISTRIBUTION_GROUP_ALIAS` | No | `ottclouds-template` | Group alias luôn gắn vào lệnh distribute |
+| `FIREBASE_DISTRIBUTION_GROUP_NAME` | No | `OTTClouds Template` | Tên hiển thị group |
+| `FIREBASE_TARGET_GROUPS_MAP` | No | empty | Map target -> groups |
+| `FIREBASE_TARGET_TESTERS_MAP` | No | empty | Map target -> testers |
 | `FIREBASE_RELEASE_NOTES` | No | auto-generated | Release notes inline |
 | `FIREBASE_RELEASE_NOTES_FILE` | No | empty | File release notes (ưu tiên cao hơn `FIREBASE_RELEASE_NOTES`) |
-| `FIREBASE_TOKEN` | Yes*** | empty | Token cho Firebase CLI non-interactive |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Yes*** | empty | Service account JSON path cho Firebase auth |
+| `GOOGLE_APPLICATION_CREDENTIALS` | No* | empty | Service account JSON path cho Firebase auth |
+| `FIREBASE_TOKEN` | No* | empty | Token Firebase CLI (legacy, deprecated) |
 
 Ghi chú:
-- `Yes*`: bắt buộc nếu repo private hoặc cần tránh rate limit.
-- `Yes**`: bắt buộc khi channel upload tương ứng đang bật.
-- `Yes***`: cần ít nhất một trong hai cách auth Firebase.
+- `No*`: cần ít nhất một cách auth Firebase hợp lệ (service account hoặc `firebase login` session hoặc token).
 
 ## Troubleshooting nhanh
 
-- `GitHub API request failed (401/403/404)`:
-  - Kiểm tra `GITHUB_TOKEN` và quyền truy cập repo.
-- `Missing Firebase app id`:
-  - Điền `FIREBASE_APP_ID_MOBILE`/`FIREBASE_APP_ID_TV`.
+- `No merged branch contains 'app-tv' or 'app-mobile'`:
+  - Commit mới không đến từ nhánh có keyword trigger build, script sẽ chỉ cập nhật state.
+- `Cannot resolve Firebase app id for target ...`:
+  - Bổ sung mapping trong `FIREBASE_TARGET_APP_MAP`.
 - `No APK files found`:
-  - Kiểm tra `BUILD_COMMAND` và output folders.
+  - Kiểm tra `BUILD_COMMAND_TV` / `BUILD_COMMAND_MOBILE` và output folders.
 - `Missing required command: firebase`:
   - Cài Firebase CLI và đảm bảo command `firebase` có trong `$PATH`.
