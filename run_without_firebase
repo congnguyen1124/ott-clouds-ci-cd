@@ -1,0 +1,1061 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_CONFIG_FILE="$SCRIPT_DIR/.env"
+
+CLI_BRANCH=""
+CLI_INTERVAL=""
+FORCE_BUILD="false"
+DRY_RUN="false"
+PRINT_CONFIG="false"
+RUN_ONCE="false"
+
+BUILD_PID=""
+BUILD_PGID=""
+SHUTDOWN_REQUESTED="false"
+PREEMPT_COMMIT=""
+LAST_CYCLE_DID_BUILD="false"
+
+usage() {
+  cat <<'__USAGE__'
+Usage: ./run_without_firebase [options]
+
+Options:
+  --branch <name>     Override DEPLOY_GIT_BRANCH
+  --interval <sec>    Override CHECK_INTERVAL_SECONDS (default 300)
+  --force, --force-build
+                      Build immediately without waiting for new commit
+  --once              Run one check/build cycle then exit
+  --dry-run           Print planned actions without real build
+  --print-config      Print effective configuration
+  -h, --help          Show help
+__USAGE__
+}
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+warn() {
+  printf '[%s] WARNING: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
+}
+
+die() {
+  printf '[%s] ERROR: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
+  exit 1
+}
+
+is_truthy() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+load_env_file() {
+  local file="$1"
+  if [[ -f "$file" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$file"
+    set +a
+  fi
+}
+
+resolve_path() {
+  local candidate="$1"
+  local base="$2"
+
+  case "$candidate" in
+    /*) printf '%s\n' "$candidate" ;;
+    *) printf '%s\n' "$base/$candidate" ;;
+  esac
+}
+
+to_lower() {
+  printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'
+}
+
+trim_value() {
+  printf '%s' "${1:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+lower_first_char() {
+  local value="${1:-}"
+  if [[ -z "$value" ]]; then
+    printf ''
+    return 0
+  fi
+
+  printf '%s%s' "$(printf '%s' "${value:0:1}" | tr '[:upper:]' '[:lower:]')" "${value:1}"
+}
+
+normalize_build_command() {
+  local raw_command
+  raw_command="$(trim_value "$1")"
+
+  if [[ -z "$raw_command" ]]; then
+    printf '\n'
+    return 0
+  fi
+
+  if printf '%s' "$raw_command" | grep -Eq '(^|[[:space:]])(\./)?gradlew([[:space:]]|$)|(^|[[:space:]])gradle([[:space:]]|$)'; then
+    printf '%s\n' "$raw_command"
+    return 0
+  fi
+
+  if printf '%s' "$raw_command" | grep -Eq '(^|[[:space:]]):?[A-Za-z0-9._-]+:assemble[A-Za-z0-9_]+'; then
+    printf './gradlew %s\n' "$raw_command"
+    return 0
+  fi
+
+  printf '%s\n' "$raw_command"
+}
+
+apply_legacy_env_compat() {
+  local legacy_used="false"
+  local build_lc=""
+
+  if [[ -n "${BUILD_COMMAND:-}" ]]; then
+    build_lc="$(to_lower "$BUILD_COMMAND")"
+    if [[ -z "${BUILD_COMMAND_TV:-}" && "$build_lc" == *":app-tv:assemble"* ]]; then
+      BUILD_COMMAND_TV="$BUILD_COMMAND"
+      legacy_used="true"
+    fi
+    if [[ -z "${BUILD_COMMAND_MOBILE:-}" && "$build_lc" == *":app-mobile:assemble"* ]]; then
+      BUILD_COMMAND_MOBILE="$BUILD_COMMAND"
+      legacy_used="true"
+    fi
+  fi
+
+  if [[ "$legacy_used" == "true" ]]; then
+    warn "Detected legacy variable names in .env. Mapped them for backward compatibility."
+    warn "Please migrate .env using .env.example field names."
+  fi
+}
+
+split_variant_parts() {
+  local variant="$1"
+  local flavor="$variant"
+  local build_type=""
+  local suffix
+  local suffixes=(
+    "Production"
+    "Release"
+    "Debug"
+    "Staging"
+    "Qa"
+    "Uat"
+    "Beta"
+    "Alpha"
+    "Prod"
+    "Internal"
+    "Profile"
+    "Benchmark"
+  )
+
+  for suffix in "${suffixes[@]}"; do
+    if [[ "$variant" == *"$suffix" && "$variant" != "$suffix" ]]; then
+      flavor="${variant%$suffix}"
+      build_type="$(to_lower "$suffix")"
+      printf '%s|%s\n' "$flavor" "$build_type"
+      return 0
+    fi
+  done
+
+  printf '%s|%s\n' "$flavor" "$build_type"
+}
+
+extract_brand_key() {
+  local raw_flavor="$1"
+  local flavor_lc
+  flavor_lc="$(to_lower "$raw_flavor")"
+  local suffix
+  local changed
+  local suffixes=(
+    "development"
+    "staging"
+    "production"
+    "internal"
+    "release"
+    "debug"
+    "dev"
+    "qa"
+    "uat"
+    "stg"
+    "prod"
+    "beta"
+    "alpha"
+  )
+
+  while true; do
+    changed="false"
+    for suffix in "${suffixes[@]}"; do
+      if [[ "$flavor_lc" == *"$suffix" && ${#flavor_lc} -gt ${#suffix} ]]; then
+        flavor_lc="${flavor_lc%$suffix}"
+        changed="true"
+        break
+      fi
+    done
+    if [[ "$changed" != "true" ]]; then
+      break
+    fi
+  done
+
+  if [[ -z "$flavor_lc" ]]; then
+    flavor_lc="$(to_lower "$raw_flavor")"
+  fi
+
+  printf '%s\n' "$flavor_lc"
+}
+
+list_build_targets_from_command() {
+  local command_text="$1"
+  local normalized
+  normalized="${command_text//$'\n'/ }"
+  local token
+  local module
+  local variant
+  local flavor
+  local build_type
+  local brand
+  local fragment
+  local target_key
+  local task_key
+  local parsed=0
+  local seen_tasks=$'\n'
+  local -a tokens=()
+
+  read -r -a tokens <<< "$normalized"
+  for token in "${tokens[@]}"; do
+    if [[ "$token" =~ ^:?([A-Za-z0-9._-]+):assemble([A-Za-z0-9_]+)$ ]]; then
+      module="${BASH_REMATCH[1]}"
+      variant="${BASH_REMATCH[2]}"
+    else
+      continue
+    fi
+
+    task_key="${module}:${variant}"
+    if [[ "$seen_tasks" == *$'\n'"$task_key"$'\n'* ]]; then
+      continue
+    fi
+    seen_tasks+="${task_key}"$'\n'
+
+    IFS='|' read -r flavor build_type <<< "$(split_variant_parts "$variant")"
+    brand="$(extract_brand_key "$flavor")"
+    fragment="/$(lower_first_char "$flavor")/"
+    if [[ -n "$build_type" ]]; then
+      fragment="${fragment}${build_type}/"
+    fi
+
+    target_key="${module}:${brand}"
+    printf '%s|%s|%s|%s|%s\n' "$module" "$variant" "$brand" "$fragment" "$target_key"
+    parsed=1
+  done
+
+  if [[ "$parsed" -eq 0 ]]; then
+    return 1
+  fi
+}
+
+collect_target_apks() {
+  local module="$1"
+  local variant="$2"
+  local brand="$3"
+  local fragment="$4"
+  local marker_file="$5"
+  local allow_stale="$6"
+  local output_dir="$ANDROID_REPO_PATH/$module/build/outputs/apk"
+  local variant_lc
+  variant_lc="$(to_lower "$variant")"
+  local brand_lc
+  brand_lc="$(to_lower "$brand")"
+  local apk
+  local -a apks=()
+  local seen_apks=$'\n'
+
+  while IFS= read -r apk; do
+    [[ -n "$apk" ]] || continue
+    if [[ "$seen_apks" != *$'\n'"$apk"$'\n'* ]]; then
+      apks+=("$apk")
+      seen_apks+="${apk}"$'\n'
+    fi
+  done < <(collect_apks_for_flavor "$output_dir" "$fragment" "$marker_file" "$allow_stale")
+
+  if [[ ${#apks[@]} -eq 0 ]]; then
+    while IFS= read -r apk; do
+      [[ -n "$apk" ]] || continue
+      local apk_lc
+      apk_lc="$(to_lower "$apk")"
+      if [[ "$apk_lc" != *"$variant_lc"* && -n "$brand_lc" && "$apk_lc" != *"$brand_lc"* ]]; then
+        continue
+      fi
+      if [[ "$seen_apks" != *$'\n'"$apk"$'\n'* ]]; then
+        apks+=("$apk")
+        seen_apks+="${apk}"$'\n'
+      fi
+    done < <(collect_apks "$output_dir" "$marker_file" "$allow_stale")
+  fi
+
+  printf '%s\n' "${apks[@]}"
+}
+
+infer_target_from_apk_path() {
+  local apk_path="$1"
+  local module=""
+  local flavor=""
+  local build_type=""
+  local brand=""
+  local fragment=""
+
+  if [[ "$apk_path" =~ /([^/]+)/build/outputs/apk/([^/]+)/([^/]+)/ ]]; then
+    module="${BASH_REMATCH[1]}"
+    flavor="${BASH_REMATCH[2]}"
+    build_type="${BASH_REMATCH[3]}"
+    fragment="/${flavor}/${build_type}/"
+  elif [[ "$apk_path" =~ /([^/]+)/build/outputs/apk/([^/]+)/ ]]; then
+    module="${BASH_REMATCH[1]}"
+    flavor="${BASH_REMATCH[2]}"
+    fragment="/${flavor}/"
+  else
+    return 1
+  fi
+
+  brand="$(extract_brand_key "$flavor")"
+  if [[ -z "$brand" || "$brand" == "release" || "$brand" == "debug" ]]; then
+    return 1
+  fi
+
+  printf '%s|%s|%s|%s|%s\n' "$module" "$flavor" "$brand" "$fragment" "${module}:${brand}"
+}
+
+extract_merged_branch_from_subject() {
+  local subject="$1"
+  local ref=""
+  local branch=""
+
+  if [[ "$subject" =~ ^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]([^[:space:]]+) ]]; then
+    ref="${BASH_REMATCH[1]}"
+    if [[ "$ref" == */* ]]; then
+      branch="${ref#*/}"
+    else
+      branch="$ref"
+    fi
+    printf '%s\n' "$branch"
+    return 0
+  fi
+
+  if [[ "$subject" =~ ^Merge[[:space:]]branch[[:space:]]\'([^\']+)\' ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  if [[ "$subject" =~ ^Merge[[:space:]]remote-tracking[[:space:]]branch[[:space:]]\'([^\']+)\' ]]; then
+    ref="${BASH_REMATCH[1]}"
+    if [[ "$ref" == */* ]]; then
+      branch="${ref#*/}"
+    else
+      branch="$ref"
+    fi
+    printf '%s\n' "$branch"
+    return 0
+  fi
+
+  return 1
+}
+
+list_recent_merged_branches() {
+  local repo_path="$1"
+  local from_commit="$2"
+  local to_commit="$3"
+  local limit="$4"
+  local subjects=""
+
+  if [[ -n "$from_commit" ]] && git -C "$repo_path" cat-file -e "${from_commit}^{commit}" >/dev/null 2>&1; then
+    subjects="$(git -C "$repo_path" log --merges --format='%s' "${from_commit}..${to_commit}" 2>/dev/null || true)"
+  else
+    subjects="$(git -C "$repo_path" log --merges --format='%s' -n "$limit" "$to_commit" 2>/dev/null || true)"
+  fi
+
+  local seen=$'\n'
+  local subject
+  local branch
+  while IFS= read -r subject; do
+    [[ -n "$subject" ]] || continue
+    branch="$(extract_merged_branch_from_subject "$subject" || true)"
+    [[ -n "$branch" ]] || continue
+    if [[ "$seen" == *$'\n'"$branch"$'\n'* ]]; then
+      continue
+    fi
+    seen+="${branch}"$'\n'
+    printf '%s\n' "$branch"
+  done <<< "$subjects"
+}
+
+parse_arguments() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --branch)
+        [[ $# -ge 2 ]] || die "Missing value for --branch"
+        CLI_BRANCH="$2"
+        shift 2
+        ;;
+      --interval)
+        [[ $# -ge 2 ]] || die "Missing value for --interval"
+        CLI_INTERVAL="$2"
+        shift 2
+        ;;
+      --force|--force-build)
+        FORCE_BUILD="true"
+        shift
+        ;;
+      --once)
+        RUN_ONCE="true"
+        shift
+        ;;
+      --dry-run)
+        DRY_RUN="true"
+        shift
+        ;;
+      --print-config)
+        PRINT_CONFIG="true"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+  done
+}
+
+require_command() {
+  local command_name="$1"
+  command -v "$command_name" >/dev/null 2>&1 || die "Missing required command: $command_name"
+}
+
+ensure_java_runtime() {
+  if command -v java >/dev/null 2>&1 && java -version >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local candidates=()
+  if [[ -n "${JAVA_HOME:-}" ]]; then
+    candidates+=("$JAVA_HOME")
+  fi
+
+  candidates+=(
+    "$HOME/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+    "/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+    "$HOME/Applications/Android Studio.app/Contents/jre/Contents/Home"
+    "/Applications/Android Studio.app/Contents/jre/Contents/Home"
+  )
+
+  if [[ -d "/Library/Java/JavaVirtualMachines" ]]; then
+    local vm_home
+    while IFS= read -r vm_home; do
+      candidates+=("$vm_home")
+    done < <(find /Library/Java/JavaVirtualMachines -maxdepth 3 -type d -name Home 2>/dev/null | sort)
+  fi
+
+  local home
+  for home in "${candidates[@]}"; do
+    if [[ -x "$home/bin/java" ]]; then
+      export JAVA_HOME="$home"
+      export PATH="$JAVA_HOME/bin:$PATH"
+      if java -version >/dev/null 2>&1; then
+        log "Using Java runtime from: $JAVA_HOME"
+        return 0
+      fi
+    fi
+  done
+
+  die "Unable to locate Java Runtime. Set JAVA_HOME to a valid JDK and try again."
+}
+
+fetch_latest_branch_commit() {
+  local repo_path="$1"
+  local remote_name="$2"
+  local branch="$3"
+
+  git -C "$repo_path" fetch --quiet "$remote_name" "$branch:refs/remotes/$remote_name/$branch" || return 1
+  git -C "$repo_path" rev-parse "refs/remotes/$remote_name/$branch^{commit}" 2>/dev/null || return 1
+}
+
+sync_branch_before_build() {
+  local repo_path="$1"
+  local remote_name="$2"
+  local branch="$3"
+
+  if is_truthy "$DRY_RUN"; then
+    log "[DRY-RUN] Skip checkout/pull before build."
+    return 0
+  fi
+
+  log "Sync branch before build: $remote_name/$branch"
+
+  if ! git -C "$repo_path" fetch --quiet "$remote_name" "$branch:refs/remotes/$remote_name/$branch"; then
+    warn "Cannot fetch $remote_name/$branch before build."
+    return 1
+  fi
+
+  if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$repo_path" checkout -q "$branch" || return 1
+  else
+    git -C "$repo_path" checkout -q -B "$branch" "$remote_name/$branch" || return 1
+  fi
+
+  git -C "$repo_path" pull --ff-only "$remote_name" "$branch" >/dev/null || return 1
+  return 0
+}
+
+get_state_value() {
+  local key="$1"
+  local state_file="$2"
+
+  if [[ ! -f "$state_file" ]]; then
+    printf ''
+    return 0
+  fi
+
+  grep -E "^${key}=" "$state_file" | tail -n 1 | sed -E 's/^[^=]+=//; s/^"//; s/"$//' || true
+}
+
+save_state() {
+  local state_file="$1"
+  local branch="$2"
+  local commit="$3"
+  local commit_time="$4"
+
+  if is_truthy "$DRY_RUN"; then
+    log "[DRY-RUN] Skip updating state file"
+    return 0
+  fi
+
+  cat > "$state_file" <<__STATE__
+LAST_PROCESSED_BRANCH="$branch"
+LAST_PROCESSED_COMMIT="$commit"
+LAST_PROCESSED_COMMIT_TIME="$commit_time"
+UPDATED_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+__STATE__
+}
+
+collect_apks() {
+  local output_dir="$1"
+  local marker_file="$2"
+  local allow_stale="$3"
+
+  if [[ ! -d "$output_dir" ]]; then
+    return 0
+  fi
+
+  find "$output_dir" -type f -name '*.apk' -newer "$marker_file" | sort
+
+  if is_truthy "$allow_stale"; then
+    local count
+    count="$(find "$output_dir" -type f -name '*.apk' -newer "$marker_file" | wc -l | tr -d ' ')"
+    if [[ "$count" == "0" ]]; then
+      find "$output_dir" -type f -name '*.apk' | sort
+    fi
+  fi
+}
+
+collect_apks_for_flavor() {
+  local output_dir="$1"
+  local flavor_fragment="$2"
+  local marker_file="$3"
+  local allow_stale="$4"
+
+  if [[ ! -d "$output_dir" ]]; then
+    return 0
+  fi
+
+  find "$output_dir" -type f -name '*.apk' -path "*${flavor_fragment}*" -newer "$marker_file" | sort
+
+  if is_truthy "$allow_stale"; then
+    local count
+    count="$(find "$output_dir" -type f -name '*.apk' -path "*${flavor_fragment}*" -newer "$marker_file" | wc -l | tr -d ' ')"
+    if [[ "$count" == "0" ]]; then
+      find "$output_dir" -type f -name '*.apk' -path "*${flavor_fragment}*" | sort
+    fi
+  fi
+}
+
+stop_running_build() {
+  local reason="$1"
+
+  if [[ -n "$BUILD_PID" ]]; then
+    if is_pid_running "$BUILD_PID"; then
+      log "$reason"
+      if [[ -n "$BUILD_PGID" ]]; then
+        kill -TERM "-$BUILD_PGID" 2>/dev/null || true
+      else
+        kill -TERM "$BUILD_PID" 2>/dev/null || true
+      fi
+    fi
+    wait "$BUILD_PID" 2>/dev/null || true
+  fi
+
+  BUILD_PID=""
+  BUILD_PGID=""
+}
+
+on_signal() {
+  SHUTDOWN_REQUESTED="true"
+  stop_running_build "Shutdown requested. Stopping current build process..."
+}
+
+start_build_background() {
+  local repo_path="$1"
+  local command_text="$2"
+
+  if command -v setsid >/dev/null 2>&1; then
+    (
+      cd "$repo_path"
+      exec setsid bash -lc "$command_text"
+    ) &
+    BUILD_PID="$!"
+    BUILD_PGID="$BUILD_PID"
+  else
+    (
+      cd "$repo_path"
+      exec bash -lc "$command_text"
+    ) &
+    BUILD_PID="$!"
+    BUILD_PGID=""
+  fi
+}
+
+is_pid_running() {
+  local pid="$1"
+
+  [[ -n "$pid" ]] || return 1
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+
+  local stat
+  stat="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ -n "$stat" ]] || return 1
+
+  case "$stat" in
+    Z*|*Z*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+run_build_with_preemption() {
+  local repo_path="$1"
+  local command_text="$2"
+  local target_commit="$3"
+
+  PREEMPT_COMMIT=""
+
+  if is_truthy "$DRY_RUN"; then
+    log "[DRY-RUN] Build command: $command_text"
+    return 0
+  fi
+
+  log "Running build command in $repo_path"
+  start_build_background "$repo_path" "$command_text"
+
+  local elapsed_seconds=0
+  while true; do
+    if ! is_pid_running "$BUILD_PID"; then
+      break
+    fi
+
+    sleep 1
+
+    if is_truthy "$SHUTDOWN_REQUESTED"; then
+      stop_running_build "Shutdown requested during build."
+      return 130
+    fi
+
+    elapsed_seconds=$((elapsed_seconds + 1))
+    if [[ "$elapsed_seconds" -lt "$CHECK_INTERVAL_SECONDS" ]]; then
+      continue
+    fi
+    elapsed_seconds=0
+
+    local newest_commit
+    if ! newest_commit="$(fetch_latest_branch_commit "$ANDROID_REPO_PATH" "$GIT_REMOTE_NAME" "$DEPLOY_GIT_BRANCH")"; then
+      warn "Cannot fetch branch while build is running. Keep current build and retry check in next cycle."
+      continue
+    fi
+
+    if [[ "$newest_commit" != "$target_commit" ]]; then
+      PREEMPT_COMMIT="$newest_commit"
+      stop_running_build "Detected newer commit $newest_commit while building $target_commit. Cancelling current build..."
+      return 2
+    fi
+  done
+
+  local build_exit=0
+  wait "$BUILD_PID" || build_exit=$?
+  BUILD_PID=""
+  BUILD_PGID=""
+
+  if [[ "$build_exit" -ne 0 ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
+print_config() {
+  cat <<__CONFIG__
+Effective configuration:
+  ANDROID_REPO_PATH=$ANDROID_REPO_PATH
+  DEPLOY_GIT_BRANCH=$DEPLOY_GIT_BRANCH
+  GIT_REMOTE_NAME=$GIT_REMOTE_NAME
+  CHECK_INTERVAL_SECONDS=$CHECK_INTERVAL_SECONDS
+  BUILD_COMMAND_TV=${BUILD_COMMAND_TV:-}
+  BUILD_COMMAND_MOBILE=${BUILD_COMMAND_MOBILE:-}
+  EFFECTIVE_BUILD_COMMAND_TV=${EFFECTIVE_BUILD_COMMAND_TV:-}
+  EFFECTIVE_BUILD_COMMAND_MOBILE=${EFFECTIVE_BUILD_COMMAND_MOBILE:-}
+  MAX_MERGE_COMMITS_SCAN=$MAX_MERGE_COMMITS_SCAN
+  MOBILE_APK_OUTPUT_DIR=$MOBILE_APK_OUTPUT_DIR
+  TV_APK_OUTPUT_DIR=$TV_APK_OUTPUT_DIR
+  FAIL_IF_APK_NOT_FOUND=$FAIL_IF_APK_NOT_FOUND
+  ALLOW_STALE_APK_FALLBACK=$ALLOW_STALE_APK_FALLBACK
+  STATE_FILE=$STATE_FILE
+  FORCE_BUILD=$FORCE_BUILD
+  RUN_ONCE=$RUN_ONCE
+  DRY_RUN=$DRY_RUN
+__CONFIG__
+}
+
+run_single_cycle() {
+  local force_this_cycle="$1"
+  LAST_CYCLE_DID_BUILD="false"
+
+  local latest_commit
+  if ! latest_commit="$(fetch_latest_branch_commit "$ANDROID_REPO_PATH" "$GIT_REMOTE_NAME" "$DEPLOY_GIT_BRANCH")"; then
+    warn "Cannot fetch branch '$DEPLOY_GIT_BRANCH' from '$GIT_REMOTE_NAME'."
+    return 11
+  fi
+
+  local last_processed_commit
+  last_processed_commit="$(get_state_value 'LAST_PROCESSED_COMMIT' "$STATE_FILE")"
+
+  local should_build="false"
+  if is_truthy "$force_this_cycle"; then
+    should_build="true"
+    log "Force build mode enabled for this cycle."
+  elif [[ -z "$last_processed_commit" ]]; then
+    should_build="true"
+    log "No state found for branch $DEPLOY_GIT_BRANCH. First cycle will build latest commit."
+  elif [[ "$latest_commit" != "$last_processed_commit" ]]; then
+    should_build="true"
+    log "New commit detected on $GIT_REMOTE_NAME/$DEPLOY_GIT_BRANCH"
+    log "Previous: $last_processed_commit"
+    log "Latest  : $latest_commit"
+  fi
+
+  if ! is_truthy "$should_build"; then
+    log "No new commit on $GIT_REMOTE_NAME/$DEPLOY_GIT_BRANCH"
+    return 0
+  fi
+
+  local target_commit="$latest_commit"
+  local baseline_commit="$last_processed_commit"
+  while true; do
+    if ! sync_branch_before_build "$ANDROID_REPO_PATH" "$GIT_REMOTE_NAME" "$DEPLOY_GIT_BRANCH"; then
+      warn "Cannot sync branch before build. Will retry in next cycle."
+      return 25
+    fi
+
+    if ! is_truthy "$DRY_RUN"; then
+      local pulled_head
+      pulled_head="$(git -C "$ANDROID_REPO_PATH" rev-parse HEAD)"
+      if [[ "$pulled_head" != "$target_commit" ]]; then
+        log "Pulled newer HEAD before build: $target_commit -> $pulled_head"
+        target_commit="$pulled_head"
+      fi
+    fi
+
+    local target_commit_time
+    local target_commit_subject
+
+    target_commit_time="$(git -C "$ANDROID_REPO_PATH" show -s --format=%cI "$target_commit")"
+    target_commit_subject="$(git -C "$ANDROID_REPO_PATH" show -s --format=%s "$target_commit")"
+
+    log "Target commit: $target_commit"
+    log "Commit time  : $target_commit_time"
+    log "Commit title : $target_commit_subject"
+
+    local -a recent_merged_branches=()
+    local merged_branch
+    while IFS= read -r merged_branch; do
+      [[ -n "$merged_branch" ]] && recent_merged_branches+=("$merged_branch")
+    done < <(list_recent_merged_branches "$ANDROID_REPO_PATH" "$baseline_commit" "$target_commit" "$MAX_MERGE_COMMITS_SCAN")
+
+    local should_build_tv="false"
+    local should_build_mobile="false"
+    if [[ ${#recent_merged_branches[@]} -gt 0 ]]; then
+      log "Detected merged branch names in latest range:"
+      printf '%s\n' "${recent_merged_branches[@]}"
+
+      for merged_branch in "${recent_merged_branches[@]}"; do
+        local merged_branch_lc
+        merged_branch_lc="$(to_lower "$merged_branch")"
+        if [[ "$merged_branch_lc" == *"app-tv"* ]]; then
+          should_build_tv="true"
+        fi
+        if [[ "$merged_branch_lc" == *"app-mobile"* ]]; then
+          should_build_mobile="true"
+        fi
+      done
+    else
+      log "No merge-branch name detected from recent merge commits."
+    fi
+
+    if [[ "$should_build_tv" != "true" && "$should_build_mobile" != "true" ]]; then
+      log "No merged branch contains 'app-tv' or 'app-mobile'. Marking latest commit as processed without build."
+      save_state "$STATE_FILE" "$DEPLOY_GIT_BRANCH" "$target_commit" "$target_commit_time"
+      LAST_CYCLE_DID_BUILD="false"
+      return 0
+    fi
+
+    local selected_effective_build_command=""
+    if [[ "$should_build_tv" == "true" ]]; then
+      [[ -n "$EFFECTIVE_BUILD_COMMAND_TV" ]] || die "BUILD_COMMAND_TV is empty. Please set BUILD_COMMAND_TV in .env."
+      selected_effective_build_command="$EFFECTIVE_BUILD_COMMAND_TV"
+      log "Trigger TV build due to merged branch keyword 'app-tv'."
+    fi
+    if [[ "$should_build_mobile" == "true" ]]; then
+      [[ -n "$EFFECTIVE_BUILD_COMMAND_MOBILE" ]] || die "BUILD_COMMAND_MOBILE is empty. Please set BUILD_COMMAND_MOBILE in .env."
+      if [[ -n "$selected_effective_build_command" ]]; then
+        selected_effective_build_command="$selected_effective_build_command && $EFFECTIVE_BUILD_COMMAND_MOBILE"
+      else
+        selected_effective_build_command="$EFFECTIVE_BUILD_COMMAND_MOBILE"
+      fi
+      log "Trigger mobile build due to merged branch keyword 'app-mobile'."
+    fi
+
+    [[ -n "$selected_effective_build_command" ]] || die "No effective build command selected for current cycle."
+
+    local build_marker_file="$STATE_DIR/build_marker"
+    touch "$build_marker_file"
+
+    if run_build_with_preemption "$ANDROID_REPO_PATH" "$selected_effective_build_command" "$target_commit"; then
+      :
+    else
+      local build_status=$?
+      if [[ "$build_status" -eq 2 ]]; then
+        target_commit="$PREEMPT_COMMIT"
+        log "Restarting build with newer commit: $target_commit"
+        continue
+      fi
+
+      if [[ "$build_status" -eq 130 ]]; then
+        return 130
+      fi
+
+      warn "Build command failed for commit $target_commit"
+      return 21
+    fi
+
+    local mobile_output_dir
+    local tv_output_dir
+    mobile_output_dir="$(resolve_path "$MOBILE_APK_OUTPUT_DIR" "$ANDROID_REPO_PATH")"
+    tv_output_dir="$(resolve_path "$TV_APK_OUTPUT_DIR" "$ANDROID_REPO_PATH")"
+
+    local mobile_apks=()
+    while IFS= read -r apk_file; do
+      [[ -n "$apk_file" ]] && mobile_apks+=("$apk_file")
+    done < <(collect_apks "$mobile_output_dir" "$build_marker_file" "$ALLOW_STALE_APK_FALLBACK")
+
+    local tv_apks=()
+    while IFS= read -r apk_file; do
+      [[ -n "$apk_file" ]] && tv_apks+=("$apk_file")
+    done < <(collect_apks "$tv_output_dir" "$build_marker_file" "$ALLOW_STALE_APK_FALLBACK")
+
+    if ! is_truthy "$DRY_RUN"; then
+      if [[ ${#mobile_apks[@]} -eq 0 && ${#tv_apks[@]} -eq 0 ]]; then
+        warn "No APK files found after build"
+        return 22
+      fi
+
+      if is_truthy "$FAIL_IF_APK_NOT_FOUND" && [[ ${#mobile_apks[@]} -eq 0 ]]; then
+        warn "No mobile APK found in $mobile_output_dir"
+        return 23
+      fi
+
+      if is_truthy "$FAIL_IF_APK_NOT_FOUND" && [[ ${#tv_apks[@]} -eq 0 ]]; then
+        warn "No TV APK found in $tv_output_dir"
+        return 24
+      fi
+    fi
+
+    local -a build_targets=()
+    local target_line
+    while IFS= read -r target_line; do
+      [[ -n "$target_line" ]] && build_targets+=("$target_line")
+    done < <(list_build_targets_from_command "$selected_effective_build_command" || true)
+
+    if [[ ${#build_targets[@]} -eq 0 ]]; then
+      warn "Cannot parse assemble targets from BUILD_COMMAND. Trying to infer targets from APK paths."
+      local inferred_seen=$'\n'
+      local inferred_line
+      local inferred_key
+      local apk_path
+      for apk_path in "${mobile_apks[@]}" "${tv_apks[@]}"; do
+        inferred_line="$(infer_target_from_apk_path "$apk_path" || true)"
+        [[ -n "$inferred_line" ]] || continue
+        IFS='|' read -r _ _ _ _ inferred_key <<< "$inferred_line"
+        if [[ "$inferred_seen" == *$'\n'"$inferred_key"$'\n'* ]]; then
+          continue
+        fi
+        inferred_seen+="${inferred_key}"$'\n'
+        build_targets+=("$inferred_line")
+      done
+    fi
+
+    if [[ ${#build_targets[@]} -eq 0 ]]; then
+      warn "No build targets detected from BUILD_COMMAND or APK outputs."
+      if is_truthy "$FAIL_IF_APK_NOT_FOUND"; then
+        return 25
+      fi
+    fi
+
+    local target_module
+    local target_variant
+    local target_brand
+    local target_fragment
+    local target_key
+    local -a target_apks=()
+    local total_target_apk_count=0
+
+    for target_line in "${build_targets[@]}"; do
+      IFS='|' read -r target_module target_variant target_brand target_fragment target_key <<< "$target_line"
+      target_apks=()
+      while IFS= read -r apk_file; do
+        [[ -n "$apk_file" ]] && target_apks+=("$apk_file")
+      done < <(collect_target_apks "$target_module" "$target_variant" "$target_brand" "$target_fragment" "$build_marker_file" "$ALLOW_STALE_APK_FALLBACK")
+
+      if [[ ${#target_apks[@]} -gt 0 ]]; then
+        total_target_apk_count=$((total_target_apk_count + ${#target_apks[@]}))
+        log "APK files for target $target_key (${target_module}:assemble${target_variant}):"
+        printf '%s\n' "${target_apks[@]}"
+      else
+        log "No APK files found for target $target_key (${target_module}:assemble${target_variant})"
+        if is_truthy "$FAIL_IF_APK_NOT_FOUND"; then
+          return 26
+        fi
+      fi
+    done
+
+    if [[ "$total_target_apk_count" -eq 0 && ${#build_targets[@]} -gt 0 ]] && ! is_truthy "$DRY_RUN"; then
+      warn "No APK files matched detected build targets"
+      return 27
+    fi
+
+    save_state "$STATE_FILE" "$DEPLOY_GIT_BRANCH" "$target_commit" "$target_commit_time"
+    LAST_CYCLE_DID_BUILD="true"
+    log "Build cycle completed successfully."
+    return 0
+  done
+}
+
+run() {
+  trap on_signal INT TERM
+
+  parse_arguments "$@"
+
+  [[ -f "$LOCAL_CONFIG_FILE" ]] || die "Missing .env file at $LOCAL_CONFIG_FILE. Copy from .env.example first."
+  load_env_file "$LOCAL_CONFIG_FILE"
+  log "Loaded configuration from $LOCAL_CONFIG_FILE"
+  apply_legacy_env_compat
+
+  if [[ -n "$CLI_BRANCH" ]]; then
+    DEPLOY_GIT_BRANCH="$CLI_BRANCH"
+  fi
+
+  if [[ -n "$CLI_INTERVAL" ]]; then
+    CHECK_INTERVAL_SECONDS="$CLI_INTERVAL"
+  fi
+
+  : "${DEPLOY_GIT_BRANCH:?Missing DEPLOY_GIT_BRANCH in .env}"
+  : "${GIT_REMOTE_NAME:?Missing GIT_REMOTE_NAME in .env}"
+  : "${CHECK_INTERVAL_SECONDS:?Missing CHECK_INTERVAL_SECONDS in .env}"
+  : "${ANDROID_REPO_PATH:?Missing ANDROID_REPO_PATH in .env}"
+  : "${STATE_DIR:?Missing STATE_DIR in .env}"
+  : "${MOBILE_APK_OUTPUT_DIR:?Missing MOBILE_APK_OUTPUT_DIR in .env}"
+  : "${TV_APK_OUTPUT_DIR:?Missing TV_APK_OUTPUT_DIR in .env}"
+  : "${FAIL_IF_APK_NOT_FOUND:?Missing FAIL_IF_APK_NOT_FOUND in .env}"
+  : "${ALLOW_STALE_APK_FALLBACK:?Missing ALLOW_STALE_APK_FALLBACK in .env}"
+  : "${MAX_MERGE_COMMITS_SCAN:=20}"
+
+  [[ "$CHECK_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || die "CHECK_INTERVAL_SECONDS must be an integer"
+  [[ "$CHECK_INTERVAL_SECONDS" -gt 0 ]] || die "CHECK_INTERVAL_SECONDS must be greater than 0"
+  [[ "$MAX_MERGE_COMMITS_SCAN" =~ ^[0-9]+$ ]] || die "MAX_MERGE_COMMITS_SCAN must be an integer"
+  [[ "$MAX_MERGE_COMMITS_SCAN" -gt 0 ]] || die "MAX_MERGE_COMMITS_SCAN must be greater than 0"
+
+  ANDROID_REPO_PATH="$(resolve_path "$ANDROID_REPO_PATH" "$SCRIPT_DIR")"
+  STATE_DIR="$(resolve_path "$STATE_DIR" "$SCRIPT_DIR")"
+  mkdir -p "$STATE_DIR"
+  EFFECTIVE_BUILD_COMMAND_TV="$(normalize_build_command "${BUILD_COMMAND_TV:-}")"
+  EFFECTIVE_BUILD_COMMAND_TV="$(trim_value "$EFFECTIVE_BUILD_COMMAND_TV")"
+
+  EFFECTIVE_BUILD_COMMAND_MOBILE="$(normalize_build_command "${BUILD_COMMAND_MOBILE:-}")"
+  EFFECTIVE_BUILD_COMMAND_MOBILE="$(trim_value "$EFFECTIVE_BUILD_COMMAND_MOBILE")"
+
+  STATE_FILE="$STATE_DIR/${DEPLOY_GIT_BRANCH//\//_}.state"
+
+  [[ -d "$ANDROID_REPO_PATH/.git" ]] || die "ANDROID_REPO_PATH is not a git repo: $ANDROID_REPO_PATH"
+
+  require_command git
+  require_command find
+  ensure_java_runtime
+
+  if is_truthy "$PRINT_CONFIG"; then
+    print_config
+  fi
+
+  log "Branch listener started: $GIT_REMOTE_NAME/$DEPLOY_GIT_BRANCH"
+  log "Check interval: ${CHECK_INTERVAL_SECONDS}s"
+
+  local force_next_cycle="$FORCE_BUILD"
+  while true; do
+    if is_truthy "$SHUTDOWN_REQUESTED"; then
+      log "Shutdown completed. Exiting listener."
+      break
+    fi
+
+    if run_single_cycle "$force_next_cycle"; then
+      force_next_cycle="false"
+    else
+      cycle_status=$?
+      if [[ "$cycle_status" -eq 130 ]]; then
+        log "Listener stopped by signal."
+        break
+      fi
+      warn "Cycle ended with error code $cycle_status"
+      force_next_cycle="false"
+      if is_truthy "$RUN_ONCE"; then
+        exit "$cycle_status"
+      fi
+    fi
+
+    if is_truthy "$RUN_ONCE"; then
+      log "Run-once mode completed."
+      break
+    fi
+
+    if is_truthy "$LAST_CYCLE_DID_BUILD" && ! is_truthy "$DRY_RUN"; then
+      log "Build finished. Checking branch again immediately..."
+      continue
+    fi
+
+    log "Waiting ${CHECK_INTERVAL_SECONDS}s before next check..."
+    sleep "$CHECK_INTERVAL_SECONDS"
+  done
+}
+
+run "$@"

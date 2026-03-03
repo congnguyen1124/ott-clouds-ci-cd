@@ -2,25 +2,40 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_CONFIG_FILE="$SCRIPT_DIR/config/default.env"
 LOCAL_CONFIG_FILE="$SCRIPT_DIR/.env"
 
-CLI_CONFIG_FILE=""
 CLI_BRANCH=""
+CLI_INTERVAL=""
 FORCE_BUILD="false"
+FORCE_BUILD_SCOPE="auto"
+FORCE_BRANCH_MAIN="false"
 DRY_RUN="false"
 PRINT_CONFIG="false"
+RUN_ONCE="false"
+
+BUILD_PID=""
+BUILD_PGID=""
+SHUTDOWN_REQUESTED="false"
+PREEMPT_COMMIT=""
+LAST_CYCLE_DID_BUILD="false"
+FIREBASE_AUTH_MODE="session"
+FIREBASE_AUTH_ARGS=()
+FIREBASE_APPS_JSON_CACHE=""
+FIREBASE_APPS_CACHE_READY="false"
 
 usage() {
   cat <<'__USAGE__'
 Usage: ./run [options]
 
 Options:
-  --config <file>     Load an extra env file after .env
   --branch <name>     Override DEPLOY_GIT_BRANCH
-  --force-build       Build and distribute without waiting for a new merged PR
-  --dry-run           Print planned actions without building or uploading
-  --print-config      Print effective configuration (secrets are masked)
+  --interval <sec>    Override CHECK_INTERVAL_SECONDS (default 300)
+  --force, --force-build
+                      Build immediately from latest main and distribute all apps
+  --force-tv          Build immediately from latest main and distribute TV apps only
+  --once              Run one check/build cycle then exit
+  --dry-run           Print planned actions without real build/distribute
+  --print-config      Print effective configuration
   -h, --help          Show help
 __USAGE__
 }
@@ -79,21 +94,400 @@ resolve_path() {
   esac
 }
 
+to_lower() {
+  printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'
+}
+
+trim_value() {
+  printf '%s' "${1:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+lower_first_char() {
+  local value="${1:-}"
+  if [[ -z "$value" ]]; then
+    printf ''
+    return 0
+  fi
+
+  printf '%s%s' "$(printf '%s' "${value:0:1}" | tr '[:upper:]' '[:lower:]')" "${value:1}"
+}
+
+module_kind_from_name() {
+  local module_lc
+  module_lc="$(to_lower "$1")"
+  if [[ "$module_lc" == *"tv"* ]]; then
+    printf 'tv\n'
+  else
+    printf 'mobile\n'
+  fi
+}
+
+normalize_build_command() {
+  local raw_command
+  raw_command="$(trim_value "$1")"
+
+  if [[ -z "$raw_command" ]]; then
+    printf '\n'
+    return 0
+  fi
+
+  if printf '%s' "$raw_command" | grep -Eq '(^|[[:space:]])(\./)?gradlew([[:space:]]|$)|(^|[[:space:]])gradle([[:space:]]|$)'; then
+    printf '%s\n' "$raw_command"
+    return 0
+  fi
+
+  if printf '%s' "$raw_command" | grep -Eq '(^|[[:space:]]):?[A-Za-z0-9._-]+:assemble[A-Za-z0-9_]+'; then
+    printf './gradlew %s\n' "$raw_command"
+    return 0
+  fi
+
+  printf '%s\n' "$raw_command"
+}
+
+apply_legacy_env_compat() {
+  local legacy_used="false"
+  local build_lc=""
+
+  if [[ -n "${BUILD_COMMAND:-}" ]]; then
+    build_lc="$(to_lower "$BUILD_COMMAND")"
+    if [[ -z "${BUILD_COMMAND_TV:-}" && "$build_lc" == *":app-tv:assemble"* ]]; then
+      BUILD_COMMAND_TV="$BUILD_COMMAND"
+      legacy_used="true"
+    fi
+    if [[ -z "${BUILD_COMMAND_MOBILE:-}" && "$build_lc" == *":app-mobile:assemble"* ]]; then
+      BUILD_COMMAND_MOBILE="$BUILD_COMMAND"
+      legacy_used="true"
+    fi
+  fi
+
+  if [[ -n "${FIREBASE_APP_ID_MOBILE:-}" && -z "${FIREBASE_APP_ID_VIDEOHUB_MOBILE:-}" ]]; then
+    FIREBASE_APP_ID_VIDEOHUB_MOBILE="$FIREBASE_APP_ID_MOBILE"
+    legacy_used="true"
+  fi
+
+  if [[ -n "${FIREBASE_APP_ID_TV:-}" && -z "${FIREBASE_APP_ID_VIDEOHUB_TV:-}" ]]; then
+    FIREBASE_APP_ID_VIDEOHUB_TV="$FIREBASE_APP_ID_TV"
+    legacy_used="true"
+  fi
+
+  if [[ -n "${FIREBASE_GROUPS_TV:-}" ]]; then
+    [[ -n "${FIREBASE_GROUPS_VIDEOHUB_TV:-}" ]] || FIREBASE_GROUPS_VIDEOHUB_TV="$FIREBASE_GROUPS_TV"
+    [[ -n "${FIREBASE_GROUPS_SERIESHUB_TV:-}" ]] || FIREBASE_GROUPS_SERIESHUB_TV="$FIREBASE_GROUPS_TV"
+    [[ -n "${FIREBASE_GROUPS_LIVEHUB_TV:-}" ]] || FIREBASE_GROUPS_LIVEHUB_TV="$FIREBASE_GROUPS_TV"
+    legacy_used="true"
+  fi
+
+  if [[ -n "${FIREBASE_TESTERS_TV:-}" ]]; then
+    [[ -n "${FIREBASE_TESTERS_VIDEOHUB_TV:-}" ]] || FIREBASE_TESTERS_VIDEOHUB_TV="$FIREBASE_TESTERS_TV"
+    [[ -n "${FIREBASE_TESTERS_SERIESHUB_TV:-}" ]] || FIREBASE_TESTERS_SERIESHUB_TV="$FIREBASE_TESTERS_TV"
+    [[ -n "${FIREBASE_TESTERS_LIVEHUB_TV:-}" ]] || FIREBASE_TESTERS_LIVEHUB_TV="$FIREBASE_TESTERS_TV"
+    legacy_used="true"
+  fi
+
+  if [[ -n "${ENABLE_TV_DISTRIBUTION:-}" ]]; then
+    [[ -n "${ENABLE_VIDEOHUB_TV_DISTRIBUTION:-}" ]] || ENABLE_VIDEOHUB_TV_DISTRIBUTION="$ENABLE_TV_DISTRIBUTION"
+    [[ -n "${ENABLE_SERIESHUB_TV_DISTRIBUTION:-}" ]] || ENABLE_SERIESHUB_TV_DISTRIBUTION="$ENABLE_TV_DISTRIBUTION"
+    [[ -n "${ENABLE_LIVEHUB_TV_DISTRIBUTION:-}" ]] || ENABLE_LIVEHUB_TV_DISTRIBUTION="$ENABLE_TV_DISTRIBUTION"
+    legacy_used="true"
+  fi
+
+  if [[ "$legacy_used" == "true" ]]; then
+    warn "Detected legacy variable names in .env. Mapped them for backward compatibility."
+    warn "Please migrate .env using .env.example field names."
+  fi
+}
+
+split_variant_parts() {
+  local variant="$1"
+  local flavor="$variant"
+  local build_type=""
+  local suffix
+  local suffixes=(
+    "Production"
+    "Release"
+    "Debug"
+    "Staging"
+    "Qa"
+    "Uat"
+    "Beta"
+    "Alpha"
+    "Prod"
+    "Internal"
+    "Profile"
+    "Benchmark"
+  )
+
+  for suffix in "${suffixes[@]}"; do
+    if [[ "$variant" == *"$suffix" && "$variant" != "$suffix" ]]; then
+      flavor="${variant%$suffix}"
+      build_type="$(to_lower "$suffix")"
+      printf '%s|%s\n' "$flavor" "$build_type"
+      return 0
+    fi
+  done
+
+  printf '%s|%s\n' "$flavor" "$build_type"
+}
+
+extract_brand_key() {
+  local raw_flavor="$1"
+  local flavor_lc
+  flavor_lc="$(to_lower "$raw_flavor")"
+  local suffix
+  local changed
+  local suffixes=(
+    "development"
+    "staging"
+    "production"
+    "internal"
+    "release"
+    "debug"
+    "dev"
+    "qa"
+    "uat"
+    "stg"
+    "prod"
+    "beta"
+    "alpha"
+  )
+
+  while true; do
+    changed="false"
+    for suffix in "${suffixes[@]}"; do
+      if [[ "$flavor_lc" == *"$suffix" && ${#flavor_lc} -gt ${#suffix} ]]; then
+        flavor_lc="${flavor_lc%$suffix}"
+        changed="true"
+        break
+      fi
+    done
+    if [[ "$changed" != "true" ]]; then
+      break
+    fi
+  done
+
+  if [[ -z "$flavor_lc" ]]; then
+    flavor_lc="$(to_lower "$raw_flavor")"
+  fi
+
+  printf '%s\n' "$flavor_lc"
+}
+
+list_build_targets_from_command() {
+  local command_text="$1"
+  local normalized
+  normalized="${command_text//$'\n'/ }"
+  local token
+  local module
+  local variant
+  local flavor
+  local build_type
+  local brand
+  local fragment
+  local target_key
+  local module_kind
+  local task_key
+  local parsed=0
+  local seen_tasks=$'\n'
+  local -a tokens=()
+
+  read -r -a tokens <<< "$normalized"
+  for token in "${tokens[@]}"; do
+    if [[ "$token" =~ ^:?([A-Za-z0-9._-]+):assemble([A-Za-z0-9_]+)$ ]]; then
+      module="${BASH_REMATCH[1]}"
+      variant="${BASH_REMATCH[2]}"
+    else
+      continue
+    fi
+
+    task_key="${module}:${variant}"
+    if [[ "$seen_tasks" == *$'\n'"$task_key"$'\n'* ]]; then
+      continue
+    fi
+    seen_tasks+="${task_key}"$'\n'
+
+    IFS='|' read -r flavor build_type <<< "$(split_variant_parts "$variant")"
+    brand="$(extract_brand_key "$flavor")"
+    module_kind="$(module_kind_from_name "$module")"
+    fragment="/$(lower_first_char "$flavor")/"
+    if [[ -n "$build_type" ]]; then
+      fragment="${fragment}${build_type}/"
+    fi
+
+    target_key="${module}:${brand}"
+    printf '%s|%s|%s|%s|%s|%s\n' "$module" "$variant" "$brand" "$fragment" "$target_key" "$module_kind"
+    parsed=1
+  done
+
+  if [[ "$parsed" -eq 0 ]]; then
+    return 1
+  fi
+}
+
+collect_target_apks() {
+  local module="$1"
+  local variant="$2"
+  local brand="$3"
+  local fragment="$4"
+  local marker_file="$5"
+  local allow_stale="$6"
+  local output_dir="$ANDROID_REPO_PATH/$module/build/outputs/apk"
+  local variant_lc
+  variant_lc="$(to_lower "$variant")"
+  local brand_lc
+  brand_lc="$(to_lower "$brand")"
+  local apk
+  local -a apks=()
+  local seen_apks=$'\n'
+
+  while IFS= read -r apk; do
+    [[ -n "$apk" ]] || continue
+    if [[ "$seen_apks" != *$'\n'"$apk"$'\n'* ]]; then
+      apks+=("$apk")
+      seen_apks+="${apk}"$'\n'
+    fi
+  done < <(collect_apks_for_flavor "$output_dir" "$fragment" "$marker_file" "$allow_stale")
+
+  if [[ ${#apks[@]} -eq 0 ]]; then
+    while IFS= read -r apk; do
+      [[ -n "$apk" ]] || continue
+      local apk_lc
+      apk_lc="$(to_lower "$apk")"
+      if [[ "$apk_lc" != *"$variant_lc"* && -n "$brand_lc" && "$apk_lc" != *"$brand_lc"* ]]; then
+        continue
+      fi
+      if [[ "$seen_apks" != *$'\n'"$apk"$'\n'* ]]; then
+        apks+=("$apk")
+        seen_apks+="${apk}"$'\n'
+      fi
+    done < <(collect_apks "$output_dir" "$marker_file" "$allow_stale")
+  fi
+
+  if [[ ${#apks[@]} -gt 0 ]]; then
+    printf '%s\n' "${apks[@]}"
+  fi
+}
+
+infer_target_from_apk_path() {
+  local apk_path="$1"
+  local module=""
+  local flavor=""
+  local build_type=""
+  local brand=""
+  local fragment=""
+  local module_kind=""
+
+  if [[ "$apk_path" =~ /([^/]+)/build/outputs/apk/([^/]+)/([^/]+)/ ]]; then
+    module="${BASH_REMATCH[1]}"
+    flavor="${BASH_REMATCH[2]}"
+    build_type="${BASH_REMATCH[3]}"
+    fragment="/${flavor}/${build_type}/"
+  elif [[ "$apk_path" =~ /([^/]+)/build/outputs/apk/([^/]+)/ ]]; then
+    module="${BASH_REMATCH[1]}"
+    flavor="${BASH_REMATCH[2]}"
+    fragment="/${flavor}/"
+  else
+    return 1
+  fi
+
+  brand="$(extract_brand_key "$flavor")"
+  if [[ -z "$brand" || "$brand" == "release" || "$brand" == "debug" ]]; then
+    return 1
+  fi
+
+  module_kind="$(module_kind_from_name "$module")"
+  printf '%s|%s|%s|%s|%s|%s\n' "$module" "$flavor" "$brand" "$fragment" "${module}:${brand}" "$module_kind"
+}
+
+extract_merged_branch_from_subject() {
+  local subject="$1"
+  local ref=""
+  local branch=""
+
+  if [[ "$subject" =~ ^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]([^[:space:]]+) ]]; then
+    ref="${BASH_REMATCH[1]}"
+    if [[ "$ref" == */* ]]; then
+      branch="${ref#*/}"
+    else
+      branch="$ref"
+    fi
+    printf '%s\n' "$branch"
+    return 0
+  fi
+
+  if [[ "$subject" =~ ^Merge[[:space:]]branch[[:space:]]\'([^\']+)\' ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  if [[ "$subject" =~ ^Merge[[:space:]]remote-tracking[[:space:]]branch[[:space:]]\'([^\']+)\' ]]; then
+    ref="${BASH_REMATCH[1]}"
+    if [[ "$ref" == */* ]]; then
+      branch="${ref#*/}"
+    else
+      branch="$ref"
+    fi
+    printf '%s\n' "$branch"
+    return 0
+  fi
+
+  return 1
+}
+
+list_recent_merged_branches() {
+  local repo_path="$1"
+  local from_commit="$2"
+  local to_commit="$3"
+  local limit="$4"
+  local subjects=""
+
+  if [[ -n "$from_commit" ]] && git -C "$repo_path" cat-file -e "${from_commit}^{commit}" >/dev/null 2>&1; then
+    subjects="$(git -C "$repo_path" log --merges --format='%s' "${from_commit}..${to_commit}" 2>/dev/null || true)"
+  else
+    subjects="$(git -C "$repo_path" log --merges --format='%s' -n "$limit" "$to_commit" 2>/dev/null || true)"
+  fi
+
+  local seen=$'\n'
+  local subject
+  local branch
+  while IFS= read -r subject; do
+    [[ -n "$subject" ]] || continue
+    branch="$(extract_merged_branch_from_subject "$subject" || true)"
+    [[ -n "$branch" ]] || continue
+    if [[ "$seen" == *$'\n'"$branch"$'\n'* ]]; then
+      continue
+    fi
+    seen+="${branch}"$'\n'
+    printf '%s\n' "$branch"
+  done <<< "$subjects"
+}
+
 parse_arguments() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --config)
-        [[ $# -ge 2 ]] || die "Missing value for --config"
-        CLI_CONFIG_FILE="$2"
-        shift 2
-        ;;
       --branch)
         [[ $# -ge 2 ]] || die "Missing value for --branch"
         CLI_BRANCH="$2"
         shift 2
         ;;
-      --force-build)
+      --interval)
+        [[ $# -ge 2 ]] || die "Missing value for --interval"
+        CLI_INTERVAL="$2"
+        shift 2
+        ;;
+      --force|--force-build)
         FORCE_BUILD="true"
+        FORCE_BUILD_SCOPE="all"
+        FORCE_BRANCH_MAIN="true"
+        shift
+        ;;
+      --force-tv)
+        FORCE_BUILD="true"
+        FORCE_BUILD_SCOPE="tv"
+        FORCE_BRANCH_MAIN="true"
+        shift
+        ;;
+      --once)
+        RUN_ONCE="true"
         shift
         ;;
       --dry-run)
@@ -120,82 +514,82 @@ require_command() {
   command -v "$command_name" >/dev/null 2>&1 || die "Missing required command: $command_name"
 }
 
-parse_owner_repo_from_remote() {
-  local repo_path="$1"
-  local remote_url
-  local slug
-
-  remote_url="$(git -C "$repo_path" config --get remote.origin.url || true)"
-  [[ -n "$remote_url" ]] || die "Cannot read remote.origin.url from $repo_path"
-
-  slug="$remote_url"
-  slug="${slug#git@github.com:}"
-  slug="${slug#https://github.com/}"
-  slug="${slug%.git}"
-
-  if [[ "$slug" != */* ]]; then
-    die "Unsupported GitHub remote URL format: $remote_url"
+ensure_java_runtime() {
+  if command -v java >/dev/null 2>&1 && java -version >/dev/null 2>&1; then
+    return 0
   fi
 
-  GITHUB_OWNER="${slug%%/*}"
-  GITHUB_REPO="${slug##*/}"
-}
-
-github_api_get_closed_prs() {
-  local owner="$1"
-  local repo="$2"
-  local branch="$3"
-  local encoded_branch
-  local api_url
-  local response_file
-  local status_code
-
-  encoded_branch="$(printf '%s' "$branch" | jq -sRr @uri)"
-  api_url="${GITHUB_API_URL%/}/repos/$owner/$repo/pulls?state=closed&base=$encoded_branch&sort=updated&direction=desc&per_page=$MAX_PULLS_TO_SCAN"
-
-  response_file="$(mktemp)"
-
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    status_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
-      -H 'Accept: application/vnd.github+json' \
-      -H "Authorization: Bearer $GITHUB_TOKEN" \
-      -H 'X-GitHub-Api-Version: 2022-11-28' \
-      -H 'User-Agent: ott-clouds-ci-cd' \
-      "$api_url")"
-  else
-    status_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
-      -H 'Accept: application/vnd.github+json' \
-      -H 'X-GitHub-Api-Version: 2022-11-28' \
-      -H 'User-Agent: ott-clouds-ci-cd' \
-      "$api_url")"
+  local candidates=()
+  if [[ -n "${JAVA_HOME:-}" ]]; then
+    candidates+=("$JAVA_HOME")
   fi
 
-  if [[ "$status_code" -lt 200 || "$status_code" -gt 299 ]]; then
-    local api_message
-    api_message="$(jq -r '.message // empty' "$response_file" 2>/dev/null || true)"
-    rm -f "$response_file"
-    if [[ -n "$api_message" ]]; then
-      die "GitHub API request failed ($status_code): $api_message"
+  candidates+=(
+    "$HOME/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+    "/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+    "$HOME/Applications/Android Studio.app/Contents/jre/Contents/Home"
+    "/Applications/Android Studio.app/Contents/jre/Contents/Home"
+  )
+
+  if [[ -d "/Library/Java/JavaVirtualMachines" ]]; then
+    local vm_home
+    while IFS= read -r vm_home; do
+      candidates+=("$vm_home")
+    done < <(find /Library/Java/JavaVirtualMachines -maxdepth 3 -type d -name Home 2>/dev/null | sort)
+  fi
+
+  local home
+  for home in "${candidates[@]}"; do
+    if [[ -x "$home/bin/java" ]]; then
+      export JAVA_HOME="$home"
+      export PATH="$JAVA_HOME/bin:$PATH"
+      if java -version >/dev/null 2>&1; then
+        log "Using Java runtime from: $JAVA_HOME"
+        return 0
+      fi
     fi
-    die "GitHub API request failed with HTTP $status_code"
+  done
+
+  die "Unable to locate Java Runtime. Set JAVA_HOME to a valid JDK and try again."
+}
+
+fetch_latest_branch_commit() {
+  local repo_path="$1"
+  local remote_name="$2"
+  local branch="$3"
+
+  git -C "$repo_path" fetch --quiet "$remote_name" "$branch:refs/remotes/$remote_name/$branch" || return 1
+  git -C "$repo_path" rev-parse "refs/remotes/$remote_name/$branch^{commit}" 2>/dev/null || return 1
+}
+
+sync_branch_before_build() {
+  local repo_path="$1"
+  local remote_name="$2"
+  local branch="$3"
+
+  if is_truthy "$DRY_RUN"; then
+    log "[DRY-RUN] Skip checkout/pull before build."
+    return 0
   fi
 
-  cat "$response_file"
-  rm -f "$response_file"
+  log "Sync branch before build: $remote_name/$branch"
+
+  if ! git -C "$repo_path" fetch --quiet "$remote_name" "$branch:refs/remotes/$remote_name/$branch"; then
+    warn "Cannot fetch $remote_name/$branch before build."
+    return 1
+  fi
+
+  if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$repo_path" checkout -q "$branch" || return 1
+  else
+    git -C "$repo_path" checkout -q -B "$branch" "$remote_name/$branch" || return 1
+  fi
+
+  git -C "$repo_path" pull --ff-only "$remote_name" "$branch" >/dev/null || return 1
+  return 0
 }
 
-latest_merged_pr_json() {
-  local closed_prs_json="$1"
-  local branch="$2"
-
-  printf '%s' "$closed_prs_json" | jq -c --arg branch "$branch" '
-    [.[] | select(.merged_at != null and .base.ref == $branch)]
-    | sort_by(.merged_at)
-    | last // empty
-  '
-}
-
-read_state_value() {
+get_state_value() {
   local key="$1"
   local state_file="$2"
 
@@ -204,55 +598,26 @@ read_state_value() {
     return 0
   fi
 
-  jq -r --arg key "$key" '.[$key] // empty' "$state_file" 2>/dev/null || true
+  grep -E "^${key}=" "$state_file" | tail -n 1 | sed -E 's/^[^=]+=//; s/^"//; s/"$//' || true
 }
 
-print_config() {
-  cat <<__CONFIG__
-Effective configuration:
-  ANDROID_REPO_PATH=$ANDROID_REPO_PATH
-  DEPLOY_GIT_BRANCH=$DEPLOY_GIT_BRANCH
-  GITHUB_OWNER=$GITHUB_OWNER
-  GITHUB_REPO=$GITHUB_REPO
-  GITHUB_API_URL=$GITHUB_API_URL
-  MAX_PULLS_TO_SCAN=$MAX_PULLS_TO_SCAN
-  BUILD_COMMAND=$BUILD_COMMAND
-  MOBILE_APK_OUTPUT_DIR=$MOBILE_APK_OUTPUT_DIR
-  TV_APK_OUTPUT_DIR=$TV_APK_OUTPUT_DIR
-  ENABLE_MOBILE_DISTRIBUTION=$ENABLE_MOBILE_DISTRIBUTION
-  ENABLE_TV_DISTRIBUTION=$ENABLE_TV_DISTRIBUTION
-  FAIL_IF_APK_NOT_FOUND=$FAIL_IF_APK_NOT_FOUND
-  ALLOW_STALE_APK_FALLBACK=$ALLOW_STALE_APK_FALLBACK
-  FIREBASE_CLI_BIN=$FIREBASE_CLI_BIN
-  FIREBASE_APP_ID_MOBILE=$FIREBASE_APP_ID_MOBILE
-  FIREBASE_APP_ID_TV=$FIREBASE_APP_ID_TV
-  FIREBASE_GROUPS_MOBILE=$FIREBASE_GROUPS_MOBILE
-  FIREBASE_GROUPS_TV=$FIREBASE_GROUPS_TV
-  FIREBASE_TESTERS_MOBILE=$FIREBASE_TESTERS_MOBILE
-  FIREBASE_TESTERS_TV=$FIREBASE_TESTERS_TV
-  FIREBASE_RELEASE_NOTES_FILE=$FIREBASE_RELEASE_NOTES_FILE
-  GITHUB_TOKEN=$(mask_secret "${GITHUB_TOKEN:-}")
-  FIREBASE_TOKEN=$(mask_secret "${FIREBASE_TOKEN:-}")
-  STATE_FILE=$STATE_FILE
-  FORCE_BUILD=$FORCE_BUILD
-  DRY_RUN=$DRY_RUN
-__CONFIG__
-}
-
-run_build() {
-  local repo_path="$1"
-  local command_text="$2"
+save_state() {
+  local state_file="$1"
+  local branch="$2"
+  local commit="$3"
+  local commit_time="$4"
 
   if is_truthy "$DRY_RUN"; then
-    log "[DRY-RUN] Build command: $command_text"
+    log "[DRY-RUN] Skip updating state file"
     return 0
   fi
 
-  log "Running build command in $repo_path"
-  (
-    cd "$repo_path"
-    bash -lc "$command_text"
-  )
+  cat > "$state_file" <<__STATE__
+LAST_PROCESSED_BRANCH="$branch"
+LAST_PROCESSED_COMMIT="$commit"
+LAST_PROCESSED_COMMIT_TIME="$commit_time"
+UPDATED_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+__STATE__
 }
 
 collect_apks() {
@@ -271,6 +636,27 @@ collect_apks() {
     count="$(find "$output_dir" -type f -name '*.apk' -newer "$marker_file" | wc -l | tr -d ' ')"
     if [[ "$count" == "0" ]]; then
       find "$output_dir" -type f -name '*.apk' | sort
+    fi
+  fi
+}
+
+collect_apks_for_flavor() {
+  local output_dir="$1"
+  local flavor_fragment="$2"
+  local marker_file="$3"
+  local allow_stale="$4"
+
+  if [[ ! -d "$output_dir" ]]; then
+    return 0
+  fi
+
+  find "$output_dir" -type f -name '*.apk' -path "*${flavor_fragment}*" -newer "$marker_file" | sort
+
+  if is_truthy "$allow_stale"; then
+    local count
+    count="$(find "$output_dir" -type f -name '*.apk' -path "*${flavor_fragment}*" -newer "$marker_file" | wc -l | tr -d ' ')"
+    if [[ "$count" == "0" ]]; then
+      find "$output_dir" -type f -name '*.apk' -path "*${flavor_fragment}*" | sort
     fi
   fi
 }
@@ -294,7 +680,522 @@ read_release_notes() {
   printf '%s\n' "$default_notes"
 }
 
-distribute_apks() {
+setup_firebase_auth() {
+  FIREBASE_AUTH_MODE="session"
+  FIREBASE_AUTH_ARGS=()
+
+  if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+    local creds_file
+    creds_file="$(resolve_path "$GOOGLE_APPLICATION_CREDENTIALS" "$SCRIPT_DIR")"
+    [[ -f "$creds_file" ]] || die "GOOGLE_APPLICATION_CREDENTIALS file not found: $creds_file"
+    export GOOGLE_APPLICATION_CREDENTIALS="$creds_file"
+    FIREBASE_AUTH_MODE="service_account"
+    log "Using GOOGLE_APPLICATION_CREDENTIALS for Firebase authentication"
+    return 0
+  fi
+
+  if [[ -n "${FIREBASE_TOKEN:-}" ]]; then
+    if [[ "$FIREBASE_TOKEN" == "firebase_ci_token" ]]; then
+      warn "FIREBASE_TOKEN is placeholder and will be ignored"
+      FIREBASE_AUTH_MODE="session"
+      return 0
+    fi
+
+    FIREBASE_AUTH_MODE="token"
+    FIREBASE_AUTH_ARGS=(--token "$FIREBASE_TOKEN")
+    log "Using FIREBASE_TOKEN for Firebase authentication"
+    return 0
+  fi
+
+  log "Using Firebase CLI session authentication"
+}
+
+firebase_auth_preflight() {
+  local cmd=("$FIREBASE_CLI_BIN" "apps:list" "--project" "$FIREBASE_PROJECT_ID" "--json")
+
+  if [[ ${#FIREBASE_AUTH_ARGS[@]} -gt 0 ]]; then
+    cmd+=("${FIREBASE_AUTH_ARGS[@]}")
+  fi
+
+  if ! "${cmd[@]}" >/dev/null 2>&1; then
+    die "Firebase authentication failed (mode=$FIREBASE_AUTH_MODE). Use GOOGLE_APPLICATION_CREDENTIALS or run 'firebase login --reauth'."
+  fi
+}
+
+csv_merge_unique() {
+  local merged=""
+  local source
+  local token
+  local trimmed
+
+  for source in "$@"; do
+    [[ -n "$source" ]] || continue
+    IFS=',' read -r -a raw_items <<< "$source"
+    for token in "${raw_items[@]}"; do
+      trimmed="$(printf '%s' "$token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [[ -n "$trimmed" ]] || continue
+      case ",$merged," in
+        *,"$trimmed",*) ;;
+        *)
+          if [[ -z "$merged" ]]; then
+            merged="$trimmed"
+          else
+            merged="$merged,$trimmed"
+          fi
+          ;;
+      esac
+    done
+  done
+
+  printf '%s\n' "$merged"
+}
+
+ensure_distribution_group() {
+  local group_alias="$1"
+  local group_name="$2"
+  [[ -n "$group_alias" ]] || return 0
+
+  local list_cmd=("$FIREBASE_CLI_BIN" "appdistribution:group:list" "--project" "$FIREBASE_PROJECT_ID")
+  if [[ ${#FIREBASE_AUTH_ARGS[@]} -gt 0 ]]; then
+    list_cmd+=("${FIREBASE_AUTH_ARGS[@]}")
+  fi
+
+  if is_truthy "$DRY_RUN"; then
+    printf '[DRY-RUN] Firebase command:'
+    printf ' %q' "${list_cmd[@]}"
+    printf '\n'
+  else
+    local list_output
+    if ! list_output="$("${list_cmd[@]}" 2>&1)"; then
+      warn "Cannot list App Distribution groups: $list_output"
+      return 1
+    fi
+
+    if printf '%s\n' "$list_output" | grep -Eq "(^|[[:space:]])${group_alias}([[:space:]]|$)"; then
+      return 0
+    fi
+  fi
+
+  local create_cmd=("$FIREBASE_CLI_BIN" "appdistribution:group:create" "$group_name" "$group_alias" "--project" "$FIREBASE_PROJECT_ID")
+  if [[ ${#FIREBASE_AUTH_ARGS[@]} -gt 0 ]]; then
+    create_cmd+=("${FIREBASE_AUTH_ARGS[@]}")
+  fi
+
+  if is_truthy "$DRY_RUN"; then
+    printf '[DRY-RUN] Firebase command:'
+    printf ' %q' "${create_cmd[@]}"
+    printf '\n'
+    return 0
+  fi
+
+  local create_output
+  if ! create_output="$("${create_cmd[@]}" 2>&1)"; then
+    if printf '%s' "$create_output" | grep -qi "already exists"; then
+      return 0
+    fi
+    warn "Cannot create App Distribution group '$group_alias': $create_output"
+    return 1
+  fi
+
+  log "Ensured Firebase group exists: $group_alias"
+}
+
+sync_testers_to_group() {
+  local group_alias="$1"
+  local testers_csv="$2"
+  [[ -n "$group_alias" ]] || return 0
+
+  local normalized_testers
+  normalized_testers="$(csv_merge_unique "$testers_csv")"
+  if [[ -z "$normalized_testers" ]]; then
+    warn "No testers configured to add into group '$group_alias'"
+    return 0
+  fi
+
+  IFS=',' read -r -a tester_list <<< "$normalized_testers"
+  [[ ${#tester_list[@]} -gt 0 ]] || return 0
+
+  local add_cmd=("$FIREBASE_CLI_BIN" "appdistribution:testers:add" "--group-alias" "$group_alias" "--project" "$FIREBASE_PROJECT_ID")
+  if [[ ${#FIREBASE_AUTH_ARGS[@]} -gt 0 ]]; then
+    add_cmd+=("${FIREBASE_AUTH_ARGS[@]}")
+  fi
+  add_cmd+=("${tester_list[@]}")
+
+  if is_truthy "$DRY_RUN"; then
+    printf '[DRY-RUN] Firebase command:'
+    printf ' %q' "${add_cmd[@]}"
+    printf '\n'
+    return 0
+  fi
+
+  local add_output
+  if ! add_output="$("${add_cmd[@]}" 2>&1)"; then
+    warn "Cannot add testers to group '$group_alias': $add_output"
+    return 1
+  fi
+
+  log "Ensured testers are in Firebase group '$group_alias'"
+}
+
+normalize_distribution_group_alias() {
+  local current_alias_lc
+  current_alias_lc="$(to_lower "$(trim_value "${FIREBASE_DISTRIBUTION_GROUP_ALIAS:-}")")"
+
+  if [[ -z "$current_alias_lc" ]]; then
+    FIREBASE_DISTRIBUTION_GROUP_ALIAS="ottclouds-template"
+    return 0
+  fi
+
+  if [[ "$current_alias_lc" == "ottclods-template" ]]; then
+    warn "Detected legacy group alias 'ottclods-template'. Switching to 'ottclouds-template'."
+    FIREBASE_DISTRIBUTION_GROUP_ALIAS="ottclouds-template"
+    return 0
+  fi
+}
+
+is_firebase_app_id() {
+  [[ "${1:-}" =~ ^[0-9]+:[0-9]+:android:[A-Za-z0-9]+$ ]]
+}
+
+lookup_map_value() {
+  local map_text="$1"
+  local raw_key="$2"
+  local key_lc
+  key_lc="$(to_lower "$(trim_value "$raw_key")")"
+  local normalized
+  normalized="${map_text//$'\n'/;}"
+  local -a entries=()
+  local entry
+  local left
+  local right
+
+  [[ -n "$key_lc" ]] || {
+    printf ''
+    return 0
+  }
+
+  if [[ -z "$normalized" ]]; then
+    printf ''
+    return 0
+  fi
+
+  IFS=';' read -r -a entries <<< "$normalized"
+  if [[ ${#entries[@]} -eq 0 ]]; then
+    printf ''
+    return 0
+  fi
+
+  for entry in "${entries[@]}"; do
+    entry="$(trim_value "$entry")"
+    [[ -n "$entry" ]] || continue
+    [[ "$entry" == *=* ]] || continue
+    left="$(trim_value "${entry%%=*}")"
+    right="$(trim_value "${entry#*=}")"
+    if [[ "$(to_lower "$left")" == "$key_lc" ]]; then
+      printf '%s\n' "$right"
+      return 0
+    fi
+  done
+
+  printf ''
+}
+
+ensure_firebase_apps_cache() {
+  if [[ "$FIREBASE_APPS_CACHE_READY" == "true" ]]; then
+    return 0
+  fi
+
+  local cmd=("$FIREBASE_CLI_BIN" "apps:list" "--project" "$FIREBASE_PROJECT_ID" "--json")
+  if [[ ${#FIREBASE_AUTH_ARGS[@]} -gt 0 ]]; then
+    cmd+=("${FIREBASE_AUTH_ARGS[@]}")
+  fi
+
+  local output
+  if ! output="$("${cmd[@]}" 2>&1)"; then
+    warn "Cannot fetch Firebase apps list: $output"
+    return 1
+  fi
+
+  local json_payload
+  json_payload="$(printf '%s\n' "$output" | sed -n '/^{/,$p')"
+  if [[ -z "$json_payload" ]]; then
+    warn "Firebase apps:list output is not valid JSON payload"
+    return 1
+  fi
+
+  if ! printf '%s\n' "$json_payload" | jq -e '.status == "success" and (.result | type == "array")' >/dev/null 2>&1; then
+    warn "Firebase apps:list JSON parse failed"
+    return 1
+  fi
+
+  FIREBASE_APPS_JSON_CACHE="$json_payload"
+  FIREBASE_APPS_CACHE_READY="true"
+  return 0
+}
+
+resolve_app_id_by_display_name() {
+  local display_name="$1"
+  local display_lc
+  display_lc="$(to_lower "$display_name")"
+
+  ensure_firebase_apps_cache || return 1
+
+  local exact=""
+  local partial=""
+  local app_id
+  local app_display
+  while IFS=$'\t' read -r app_id app_display; do
+    [[ -n "$app_id" ]] || continue
+    local app_display_lc
+    app_display_lc="$(to_lower "$app_display")"
+    if [[ "$app_display_lc" == "$display_lc" ]]; then
+      exact="$app_id"
+      break
+    fi
+    if [[ -z "$partial" && "$app_display_lc" == *"$display_lc"* ]]; then
+      partial="$app_id"
+    fi
+  done < <(printf '%s\n' "$FIREBASE_APPS_JSON_CACHE" | jq -r '.result[] | select(.platform == "ANDROID") | [.appId, (.displayName // "")] | @tsv')
+
+  if [[ -n "$exact" ]]; then
+    printf '%s\n' "$exact"
+    return 0
+  fi
+
+  if [[ -n "$partial" ]]; then
+    printf '%s\n' "$partial"
+    return 0
+  fi
+
+  return 1
+}
+
+auto_discover_app_id_for_target() {
+  local module="$1"
+  local brand="$2"
+  local module_kind
+  module_kind="$(module_kind_from_name "$module")"
+  local brand_lc
+  brand_lc="$(to_lower "$brand")"
+
+  ensure_firebase_apps_cache || return 1
+
+  local app_id
+  local display_name
+  local namespace
+  local best_id=""
+  local best_display=""
+  local best_score=-999
+  local score
+  local display_lc
+  local namespace_lc
+  local has_tv
+  local seen_ids=$'\n'
+
+  while IFS=$'\t' read -r app_id display_name namespace; do
+    [[ -n "$app_id" ]] || continue
+    if [[ "$seen_ids" == *$'\n'"$app_id"$'\n'* ]]; then
+      continue
+    fi
+    seen_ids+="${app_id}"$'\n'
+
+    display_lc="$(to_lower "$display_name")"
+    namespace_lc="$(to_lower "$namespace")"
+    score=0
+
+    if [[ "$display_lc" == *"$brand_lc"* ]]; then
+      score=$((score + 20))
+    fi
+    if [[ "$namespace_lc" == *"$brand_lc"* ]]; then
+      score=$((score + 40))
+    fi
+    if [[ "$score" -eq 0 ]]; then
+      continue
+    fi
+
+    has_tv="false"
+    if [[ "$display_lc" == *" tv"* || "$namespace_lc" == *".tv"* ]]; then
+      has_tv="true"
+    fi
+
+    if [[ "$module_kind" == "tv" ]]; then
+      if [[ "$has_tv" == "true" ]]; then
+        score=$((score + 15))
+      else
+        score=$((score - 15))
+      fi
+    else
+      if [[ "$has_tv" == "true" ]]; then
+        score=$((score - 15))
+      else
+        score=$((score + 10))
+      fi
+    fi
+
+    if [[ "$score" -gt "$best_score" ]]; then
+      best_score="$score"
+      best_id="$app_id"
+      best_display="$display_name"
+    fi
+  done < <(printf '%s\n' "$FIREBASE_APPS_JSON_CACHE" | jq -r '.result[] | select(.platform == "ANDROID") | [.appId, (.displayName // ""), (.namespace // "")] | @tsv')
+
+  if [[ -n "$best_id" ]]; then
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "Auto-mapped Firebase app for ${module}:${brand} -> ${best_display} (${best_id})" >&2
+    printf '%s\n' "$best_id"
+    return 0
+  fi
+
+  return 1
+}
+
+default_app_id_for_target_key() {
+  local target_key="$1"
+  case "$target_key" in
+    app-mobile:videohub) printf '%s\n' "$FIREBASE_APP_ID_VIDEOHUB_MOBILE" ;;
+    app-tv:videohub) printf '%s\n' "$FIREBASE_APP_ID_VIDEOHUB_TV" ;;
+    app-tv:serieshub) printf '%s\n' "$FIREBASE_APP_ID_SERIESHUB_TV" ;;
+    app-tv:livehub) printf '%s\n' "$FIREBASE_APP_ID_LIVEHUB_TV" ;;
+    *) printf '' ;;
+  esac
+}
+
+resolve_target_app_id() {
+  local target_key="$1"
+  local module="$2"
+  local brand="$3"
+  local module_kind
+  module_kind="$(module_kind_from_name "$module")"
+  local mapped_value=""
+  local app_id=""
+
+  mapped_value="$(lookup_map_value "$FIREBASE_TARGET_APP_MAP" "$target_key")"
+  if [[ -z "$mapped_value" ]]; then
+    mapped_value="$(lookup_map_value "$FIREBASE_TARGET_APP_MAP" "${brand}-${module_kind}")"
+  fi
+  if [[ -z "$mapped_value" ]]; then
+    mapped_value="$(lookup_map_value "$FIREBASE_TARGET_APP_MAP" "$brand")"
+  fi
+
+  if [[ -n "$mapped_value" ]]; then
+    if is_firebase_app_id "$mapped_value"; then
+      printf '%s\n' "$mapped_value"
+      return 0
+    fi
+
+    if app_id="$(resolve_app_id_by_display_name "$mapped_value")"; then
+      printf '%s\n' "$app_id"
+      return 0
+    fi
+
+    warn "Cannot resolve Firebase app mapping '$mapped_value' for target '$target_key'"
+  fi
+
+  app_id="$(default_app_id_for_target_key "$target_key")"
+  if [[ -n "$app_id" ]]; then
+    printf '%s\n' "$app_id"
+    return 0
+  fi
+
+  if app_id="$(auto_discover_app_id_for_target "$module" "$brand")"; then
+    printf '%s\n' "$app_id"
+    return 0
+  fi
+
+  printf ''
+}
+
+default_groups_for_target_key() {
+  local target_key="$1"
+  case "$target_key" in
+    app-mobile:videohub) printf '%s\n' "$FIREBASE_GROUPS_MOBILE" ;;
+    app-tv:videohub) printf '%s\n' "$FIREBASE_GROUPS_VIDEOHUB_TV" ;;
+    app-tv:serieshub) printf '%s\n' "$FIREBASE_GROUPS_SERIESHUB_TV" ;;
+    app-tv:livehub) printf '%s\n' "$FIREBASE_GROUPS_LIVEHUB_TV" ;;
+    *) printf '' ;;
+  esac
+}
+
+default_testers_for_target_key() {
+  local target_key="$1"
+  case "$target_key" in
+    app-mobile:videohub) printf '%s\n' "$FIREBASE_TESTERS_MOBILE" ;;
+    app-tv:videohub) printf '%s\n' "$FIREBASE_TESTERS_VIDEOHUB_TV" ;;
+    app-tv:serieshub) printf '%s\n' "$FIREBASE_TESTERS_SERIESHUB_TV" ;;
+    app-tv:livehub) printf '%s\n' "$FIREBASE_TESTERS_LIVEHUB_TV" ;;
+    *) printf '' ;;
+  esac
+}
+
+resolve_target_groups() {
+  local target_key="$1"
+  local module="$2"
+  local brand="$3"
+  local module_kind
+  module_kind="$(module_kind_from_name "$module")"
+  local target_groups=""
+
+  target_groups="$(lookup_map_value "$FIREBASE_TARGET_GROUPS_MAP" "$target_key")"
+  if [[ -z "$target_groups" ]]; then
+    target_groups="$(lookup_map_value "$FIREBASE_TARGET_GROUPS_MAP" "${brand}-${module_kind}")"
+  fi
+  if [[ -z "$target_groups" ]]; then
+    target_groups="$(lookup_map_value "$FIREBASE_TARGET_GROUPS_MAP" "$brand")"
+  fi
+  if [[ -z "$target_groups" ]]; then
+    target_groups="$(default_groups_for_target_key "$target_key")"
+  fi
+
+  printf '%s\n' "$target_groups"
+}
+
+resolve_target_testers() {
+  local target_key="$1"
+  local module="$2"
+  local brand="$3"
+  local module_kind
+  module_kind="$(module_kind_from_name "$module")"
+  local target_testers=""
+
+  target_testers="$(lookup_map_value "$FIREBASE_TARGET_TESTERS_MAP" "$target_key")"
+  if [[ -z "$target_testers" ]]; then
+    target_testers="$(lookup_map_value "$FIREBASE_TARGET_TESTERS_MAP" "${brand}-${module_kind}")"
+  fi
+  if [[ -z "$target_testers" ]]; then
+    target_testers="$(lookup_map_value "$FIREBASE_TARGET_TESTERS_MAP" "$brand")"
+  fi
+  if [[ -z "$target_testers" ]]; then
+    target_testers="$(default_testers_for_target_key "$target_key")"
+  fi
+
+  printf '%s\n' "$target_testers"
+}
+
+is_target_distribution_enabled() {
+  local target_key="$1"
+  case "$target_key" in
+    app-mobile:videohub)
+      is_truthy "$ENABLE_MOBILE_DISTRIBUTION"
+      return $?
+      ;;
+    app-tv:videohub)
+      is_truthy "$ENABLE_VIDEOHUB_TV_DISTRIBUTION"
+      return $?
+      ;;
+    app-tv:serieshub)
+      is_truthy "$ENABLE_SERIESHUB_TV_DISTRIBUTION"
+      return $?
+      ;;
+    app-tv:livehub)
+      is_truthy "$ENABLE_LIVEHUB_TV_DISTRIBUTION"
+      return $?
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+distribute_apk_set() {
   local channel_name="$1"
   local app_id="$2"
   local groups="$3"
@@ -312,7 +1213,7 @@ distribute_apks() {
 
   local apk
   for apk in "${apks[@]}"; do
-    local cmd=("$FIREBASE_CLI_BIN" "appdistribution:distribute" "$apk" "--app" "$app_id" "--release-notes" "$release_notes")
+    local cmd=("$FIREBASE_CLI_BIN" "appdistribution:distribute" "$apk" "--app" "$app_id" "--project" "$FIREBASE_PROJECT_ID" "--release-notes" "$release_notes")
 
     if [[ -n "$groups" ]]; then
       cmd+=("--groups" "$groups")
@@ -322,8 +1223,8 @@ distribute_apks() {
       cmd+=("--testers" "$testers")
     fi
 
-    if [[ -n "${FIREBASE_TOKEN:-}" ]]; then
-      cmd+=("--token" "$FIREBASE_TOKEN")
+    if [[ ${#FIREBASE_AUTH_ARGS[@]} -gt 0 ]]; then
+      cmd+=("${FIREBASE_AUTH_ARGS[@]}")
     fi
 
     if is_truthy "$DRY_RUN"; then
@@ -337,224 +1238,641 @@ distribute_apks() {
   done
 }
 
-save_state() {
-  local state_file="$1"
-  local branch="$2"
-  local pr_number="$3"
-  local pr_merged_at="$4"
-  local pr_url="$5"
+stop_running_build() {
+  local reason="$1"
+
+  if [[ -n "$BUILD_PID" ]]; then
+    if is_pid_running "$BUILD_PID"; then
+      log "$reason"
+      if [[ -n "$BUILD_PGID" ]]; then
+        kill -TERM "-$BUILD_PGID" 2>/dev/null || true
+      else
+        kill -TERM "$BUILD_PID" 2>/dev/null || true
+      fi
+    fi
+    # Always wait to reap the child if it already exited.
+    wait "$BUILD_PID" 2>/dev/null || true
+  fi
+
+  BUILD_PID=""
+  BUILD_PGID=""
+}
+
+on_signal() {
+  SHUTDOWN_REQUESTED="true"
+  stop_running_build "Shutdown requested. Stopping current build process..."
+}
+
+start_build_background() {
+  local repo_path="$1"
+  local command_text="$2"
+
+  if command -v setsid >/dev/null 2>&1; then
+    (
+      cd "$repo_path"
+      exec setsid bash -lc "$command_text"
+    ) &
+    BUILD_PID="$!"
+    BUILD_PGID="$BUILD_PID"
+  else
+    (
+      cd "$repo_path"
+      exec bash -lc "$command_text"
+    ) &
+    BUILD_PID="$!"
+    BUILD_PGID=""
+  fi
+}
+
+is_pid_running() {
+  local pid="$1"
+
+  [[ -n "$pid" ]] || return 1
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+
+  local stat
+  stat="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ -n "$stat" ]] || return 1
+
+  case "$stat" in
+    Z*|*Z*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+run_build_with_preemption() {
+  local repo_path="$1"
+  local command_text="$2"
+  local target_commit="$3"
+
+  PREEMPT_COMMIT=""
 
   if is_truthy "$DRY_RUN"; then
-    log "[DRY-RUN] Skip updating state file"
+    log "[DRY-RUN] Build command: $command_text"
     return 0
   fi
 
-  cat > "$state_file" <<__STATE__
-{
-  "branch": "$branch",
-  "last_processed_pr_number": "$pr_number",
-  "last_processed_pr_merged_at": "$pr_merged_at",
-  "last_processed_pr_url": "$pr_url",
-  "updated_at_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  log "Running build command in $repo_path"
+  start_build_background "$repo_path" "$command_text"
+
+  local elapsed_seconds=0
+  while true; do
+    if ! is_pid_running "$BUILD_PID"; then
+      break
+    fi
+
+    sleep 1
+
+    if is_truthy "$SHUTDOWN_REQUESTED"; then
+      stop_running_build "Shutdown requested during build."
+      return 130
+    fi
+
+    elapsed_seconds=$((elapsed_seconds + 1))
+    if [[ "$elapsed_seconds" -lt "$CHECK_INTERVAL_SECONDS" ]]; then
+      continue
+    fi
+    elapsed_seconds=0
+
+    local newest_commit
+    if ! newest_commit="$(fetch_latest_branch_commit "$ANDROID_REPO_PATH" "$GIT_REMOTE_NAME" "$DEPLOY_GIT_BRANCH")"; then
+      warn "Cannot fetch branch while build is running. Keep current build and retry check in next cycle."
+      continue
+    fi
+
+    if [[ "$newest_commit" != "$target_commit" ]]; then
+      PREEMPT_COMMIT="$newest_commit"
+      stop_running_build "Detected newer commit $newest_commit while building $target_commit. Cancelling current build..."
+      return 2
+    fi
+  done
+
+  local build_exit=0
+  wait "$BUILD_PID" || build_exit=$?
+  BUILD_PID=""
+  BUILD_PGID=""
+
+  if [[ "$build_exit" -ne 0 ]]; then
+    return 1
+  fi
+
+  return 0
 }
-__STATE__
+
+print_config() {
+  cat <<__CONFIG__
+Effective configuration:
+  ANDROID_REPO_PATH=$ANDROID_REPO_PATH
+  DEPLOY_GIT_BRANCH=$DEPLOY_GIT_BRANCH
+  GIT_REMOTE_NAME=$GIT_REMOTE_NAME
+  CHECK_INTERVAL_SECONDS=$CHECK_INTERVAL_SECONDS
+  BUILD_COMMAND_TV=${BUILD_COMMAND_TV:-}
+  BUILD_COMMAND_MOBILE=${BUILD_COMMAND_MOBILE:-}
+  EFFECTIVE_BUILD_COMMAND_TV=${EFFECTIVE_BUILD_COMMAND_TV:-}
+  EFFECTIVE_BUILD_COMMAND_MOBILE=${EFFECTIVE_BUILD_COMMAND_MOBILE:-}
+  MAX_MERGE_COMMITS_SCAN=$MAX_MERGE_COMMITS_SCAN
+  MOBILE_APK_OUTPUT_DIR=$MOBILE_APK_OUTPUT_DIR
+  TV_APK_OUTPUT_DIR=$TV_APK_OUTPUT_DIR
+  FAIL_IF_APK_NOT_FOUND=$FAIL_IF_APK_NOT_FOUND
+  ALLOW_STALE_APK_FALLBACK=$ALLOW_STALE_APK_FALLBACK
+  ENABLE_DISTRIBUTION=$ENABLE_DISTRIBUTION
+  ENABLE_MOBILE_DISTRIBUTION=$ENABLE_MOBILE_DISTRIBUTION
+  ENABLE_VIDEOHUB_TV_DISTRIBUTION=$ENABLE_VIDEOHUB_TV_DISTRIBUTION
+  ENABLE_SERIESHUB_TV_DISTRIBUTION=$ENABLE_SERIESHUB_TV_DISTRIBUTION
+  ENABLE_LIVEHUB_TV_DISTRIBUTION=$ENABLE_LIVEHUB_TV_DISTRIBUTION
+  FIREBASE_PROJECT_ID=$FIREBASE_PROJECT_ID
+  FIREBASE_CLI_BIN=$FIREBASE_CLI_BIN
+  FIREBASE_APP_ID_VIDEOHUB_MOBILE=$FIREBASE_APP_ID_VIDEOHUB_MOBILE
+  FIREBASE_APP_ID_VIDEOHUB_TV=$FIREBASE_APP_ID_VIDEOHUB_TV
+  FIREBASE_APP_ID_SERIESHUB_TV=$FIREBASE_APP_ID_SERIESHUB_TV
+  FIREBASE_APP_ID_LIVEHUB_TV=$FIREBASE_APP_ID_LIVEHUB_TV
+  FIREBASE_TARGET_APP_MAP=$FIREBASE_TARGET_APP_MAP
+  FIREBASE_TARGET_GROUPS_MAP=$FIREBASE_TARGET_GROUPS_MAP
+  FIREBASE_TARGET_TESTERS_MAP=$FIREBASE_TARGET_TESTERS_MAP
+  FIREBASE_DISTRIBUTION_GROUP_ALIAS=$FIREBASE_DISTRIBUTION_GROUP_ALIAS
+  FIREBASE_DISTRIBUTION_GROUP_NAME=$FIREBASE_DISTRIBUTION_GROUP_NAME
+  FIREBASE_GROUPS_MOBILE=$FIREBASE_GROUPS_MOBILE
+  FIREBASE_GROUPS_VIDEOHUB_TV=$FIREBASE_GROUPS_VIDEOHUB_TV
+  FIREBASE_GROUPS_SERIESHUB_TV=$FIREBASE_GROUPS_SERIESHUB_TV
+  FIREBASE_GROUPS_LIVEHUB_TV=$FIREBASE_GROUPS_LIVEHUB_TV
+  FIREBASE_TESTERS_GLOBAL=$FIREBASE_TESTERS_GLOBAL
+  FIREBASE_TESTERS_MOBILE=$FIREBASE_TESTERS_MOBILE
+  FIREBASE_TESTERS_VIDEOHUB_TV=$FIREBASE_TESTERS_VIDEOHUB_TV
+  FIREBASE_TESTERS_SERIESHUB_TV=$FIREBASE_TESTERS_SERIESHUB_TV
+  FIREBASE_TESTERS_LIVEHUB_TV=$FIREBASE_TESTERS_LIVEHUB_TV
+  FIREBASE_RELEASE_NOTES_FILE=$FIREBASE_RELEASE_NOTES_FILE
+  FIREBASE_AUTH_MODE=$FIREBASE_AUTH_MODE
+  GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
+  FIREBASE_TOKEN=$(mask_secret "${FIREBASE_TOKEN:-}")
+  STATE_FILE=$STATE_FILE
+  FORCE_BUILD=$FORCE_BUILD
+  FORCE_BUILD_SCOPE=$FORCE_BUILD_SCOPE
+  FORCE_BRANCH_MAIN=$FORCE_BRANCH_MAIN
+  RUN_ONCE=$RUN_ONCE
+  DRY_RUN=$DRY_RUN
+__CONFIG__
+}
+
+run_single_cycle() {
+  local force_this_cycle="$1"
+  LAST_CYCLE_DID_BUILD="false"
+  local force_scope="${FORCE_BUILD_SCOPE:-auto}"
+
+  local latest_commit
+  if ! latest_commit="$(fetch_latest_branch_commit "$ANDROID_REPO_PATH" "$GIT_REMOTE_NAME" "$DEPLOY_GIT_BRANCH")"; then
+    warn "Cannot fetch branch '$DEPLOY_GIT_BRANCH' from '$GIT_REMOTE_NAME'."
+    return 11
+  fi
+
+  local last_processed_commit
+  last_processed_commit="$(get_state_value 'LAST_PROCESSED_COMMIT' "$STATE_FILE")"
+
+  local should_build="false"
+  if is_truthy "$force_this_cycle"; then
+    should_build="true"
+    log "Force build mode enabled for this cycle."
+  elif [[ -z "$last_processed_commit" ]]; then
+    should_build="true"
+    log "No state found for branch $DEPLOY_GIT_BRANCH. First cycle will build latest commit."
+  elif [[ "$latest_commit" != "$last_processed_commit" ]]; then
+    should_build="true"
+    log "New commit detected on $GIT_REMOTE_NAME/$DEPLOY_GIT_BRANCH"
+    log "Previous: $last_processed_commit"
+    log "Latest  : $latest_commit"
+  fi
+
+  if ! is_truthy "$should_build"; then
+    log "No new commit on $GIT_REMOTE_NAME/$DEPLOY_GIT_BRANCH"
+    return 0
+  fi
+
+  local target_commit="$latest_commit"
+  local baseline_commit="$last_processed_commit"
+  while true; do
+    if ! sync_branch_before_build "$ANDROID_REPO_PATH" "$GIT_REMOTE_NAME" "$DEPLOY_GIT_BRANCH"; then
+      warn "Cannot sync branch before build. Will retry in next cycle."
+      return 25
+    fi
+
+    if ! is_truthy "$DRY_RUN"; then
+      local pulled_head
+      pulled_head="$(git -C "$ANDROID_REPO_PATH" rev-parse HEAD)"
+      if [[ "$pulled_head" != "$target_commit" ]]; then
+        log "Pulled newer HEAD before build: $target_commit -> $pulled_head"
+        target_commit="$pulled_head"
+      fi
+    fi
+
+    local target_commit_time
+    local target_commit_subject
+
+    target_commit_time="$(git -C "$ANDROID_REPO_PATH" show -s --format=%cI "$target_commit")"
+    target_commit_subject="$(git -C "$ANDROID_REPO_PATH" show -s --format=%s "$target_commit")"
+
+    log "Target commit: $target_commit"
+    log "Commit time  : $target_commit_time"
+    log "Commit title : $target_commit_subject"
+
+    local -a recent_merged_branches=()
+    local should_build_tv="false"
+    local should_build_mobile="false"
+    local merged_branch
+    if is_truthy "$force_this_cycle"; then
+      case "$force_scope" in
+        tv)
+          should_build_tv="true"
+          log "Force TV mode enabled. Build/distribute TV apps from latest $DEPLOY_GIT_BRANCH."
+          ;;
+        all|auto|"")
+          should_build_tv="true"
+          should_build_mobile="true"
+          log "Force full mode enabled. Build/distribute all apps from latest $DEPLOY_GIT_BRANCH."
+          ;;
+        *)
+          die "Unsupported FORCE_BUILD_SCOPE: $force_scope"
+          ;;
+      esac
+    else
+      while IFS= read -r merged_branch; do
+        [[ -n "$merged_branch" ]] && recent_merged_branches+=("$merged_branch")
+      done < <(list_recent_merged_branches "$ANDROID_REPO_PATH" "$baseline_commit" "$target_commit" "$MAX_MERGE_COMMITS_SCAN")
+
+      if [[ ${#recent_merged_branches[@]} -gt 0 ]]; then
+        log "Detected merged branch names in latest range:"
+        printf '%s\n' "${recent_merged_branches[@]}"
+
+        for merged_branch in "${recent_merged_branches[@]}"; do
+          local merged_branch_lc
+          merged_branch_lc="$(to_lower "$merged_branch")"
+          if [[ "$merged_branch_lc" == *"app-tv"* ]]; then
+            should_build_tv="true"
+          fi
+          if [[ "$merged_branch_lc" == *"app-mobile"* ]]; then
+            should_build_mobile="true"
+          fi
+        done
+      else
+        log "No merge-branch name detected from recent merge commits."
+      fi
+
+      if [[ "$should_build_tv" != "true" && "$should_build_mobile" != "true" ]]; then
+        log "No merged branch contains 'app-tv' or 'app-mobile'. Marking latest commit as processed without build."
+        save_state "$STATE_FILE" "$DEPLOY_GIT_BRANCH" "$target_commit" "$target_commit_time"
+        LAST_CYCLE_DID_BUILD="false"
+        return 0
+      fi
+    fi
+
+    local selected_effective_build_command=""
+    if [[ "$should_build_tv" == "true" ]]; then
+      [[ -n "$EFFECTIVE_BUILD_COMMAND_TV" ]] || die "BUILD_COMMAND_TV is empty. Please set BUILD_COMMAND_TV in .env."
+      selected_effective_build_command="$EFFECTIVE_BUILD_COMMAND_TV"
+      if is_truthy "$force_this_cycle"; then
+        log "Trigger TV build in force mode."
+      else
+        log "Trigger TV build due to merged branch keyword 'app-tv'."
+      fi
+    fi
+    if [[ "$should_build_mobile" == "true" ]]; then
+      [[ -n "$EFFECTIVE_BUILD_COMMAND_MOBILE" ]] || die "BUILD_COMMAND_MOBILE is empty. Please set BUILD_COMMAND_MOBILE in .env."
+      if [[ -n "$selected_effective_build_command" ]]; then
+        selected_effective_build_command="$selected_effective_build_command && $EFFECTIVE_BUILD_COMMAND_MOBILE"
+      else
+        selected_effective_build_command="$EFFECTIVE_BUILD_COMMAND_MOBILE"
+      fi
+      if is_truthy "$force_this_cycle"; then
+        log "Trigger mobile build in force mode."
+      else
+        log "Trigger mobile build due to merged branch keyword 'app-mobile'."
+      fi
+    fi
+
+    [[ -n "$selected_effective_build_command" ]] || die "No effective build command selected for current cycle."
+
+    local build_marker_file="$STATE_DIR/build_marker"
+    touch "$build_marker_file"
+
+    if run_build_with_preemption "$ANDROID_REPO_PATH" "$selected_effective_build_command" "$target_commit"; then
+      :
+    else
+      local build_status=$?
+      if [[ "$build_status" -eq 2 ]]; then
+        target_commit="$PREEMPT_COMMIT"
+        log "Restarting build with newer commit: $target_commit"
+        continue
+      fi
+
+      if [[ "$build_status" -eq 130 ]]; then
+        return 130
+      fi
+
+      warn "Build command failed for commit $target_commit"
+      return 21
+    fi
+
+    local mobile_output_dir
+    local tv_output_dir
+    mobile_output_dir="$(resolve_path "$MOBILE_APK_OUTPUT_DIR" "$ANDROID_REPO_PATH")"
+    tv_output_dir="$(resolve_path "$TV_APK_OUTPUT_DIR" "$ANDROID_REPO_PATH")"
+
+    local all_mobile_apks=()
+    while IFS= read -r apk_file; do
+      [[ -n "$apk_file" ]] && all_mobile_apks+=("$apk_file")
+    done < <(collect_apks "$mobile_output_dir" "$build_marker_file" "$ALLOW_STALE_APK_FALLBACK")
+
+    local all_tv_apks=()
+    while IFS= read -r apk_file; do
+      [[ -n "$apk_file" ]] && all_tv_apks+=("$apk_file")
+    done < <(collect_apks "$tv_output_dir" "$build_marker_file" "$ALLOW_STALE_APK_FALLBACK")
+
+    if ! is_truthy "$DRY_RUN"; then
+      if [[ ${#all_mobile_apks[@]} -eq 0 && ${#all_tv_apks[@]} -eq 0 ]]; then
+        warn "No APK files found after build"
+        return 22
+      fi
+    fi
+
+    local -a build_targets=()
+    local target_line
+    while IFS= read -r target_line; do
+      [[ -n "$target_line" ]] && build_targets+=("$target_line")
+    done < <(list_build_targets_from_command "$selected_effective_build_command" || true)
+
+    if [[ ${#build_targets[@]} -eq 0 ]]; then
+      warn "Cannot parse assemble targets from BUILD_COMMAND. Trying to infer targets from APK paths."
+      local inferred_seen=$'\n'
+      local inferred_line
+      local inferred_key
+      local apk_path
+      for apk_path in "${all_mobile_apks[@]}" "${all_tv_apks[@]}"; do
+        inferred_line="$(infer_target_from_apk_path "$apk_path" || true)"
+        [[ -n "$inferred_line" ]] || continue
+        IFS='|' read -r _ _ _ _ inferred_key _ <<< "$inferred_line"
+        if [[ "$inferred_seen" == *$'\n'"$inferred_key"$'\n'* ]]; then
+          continue
+        fi
+        inferred_seen+="${inferred_key}"$'\n'
+        build_targets+=("$inferred_line")
+      done
+    fi
+
+    if [[ ${#build_targets[@]} -eq 0 ]]; then
+      warn "No build targets detected from BUILD_COMMAND or APK outputs."
+      if is_truthy "$FAIL_IF_APK_NOT_FOUND"; then
+        return 23
+      fi
+    fi
+
+    local default_release_notes="Automated distribution\nBranch: $DEPLOY_GIT_BRANCH\nCommit: $target_commit\nTitle: $target_commit_subject\nCommit time: $target_commit_time"
+    local release_notes
+    release_notes="$(read_release_notes "$default_release_notes")"
+
+    local any_recipients_configured="false"
+    local target_module
+    local target_variant
+    local target_brand
+    local target_fragment
+    local target_key
+    local target_module_kind
+    local target_distribution_enabled
+    local target_groups_raw
+    local target_testers_raw
+    local groups_effective
+    local testers_effective
+    local app_id
+    local -a target_apks=()
+    local total_target_apk_count=0
+
+    if is_truthy "$ENABLE_DISTRIBUTION" && [[ -n "$FIREBASE_DISTRIBUTION_GROUP_ALIAS" ]]; then
+      if ! ensure_distribution_group "$FIREBASE_DISTRIBUTION_GROUP_ALIAS" "$FIREBASE_DISTRIBUTION_GROUP_NAME"; then
+        return 27
+      fi
+    fi
+
+    for target_line in "${build_targets[@]}"; do
+      IFS='|' read -r target_module target_variant target_brand target_fragment target_key target_module_kind <<< "$target_line"
+      target_apks=()
+      while IFS= read -r apk_file; do
+        [[ -n "$apk_file" ]] && target_apks+=("$apk_file")
+      done < <(collect_target_apks "$target_module" "$target_variant" "$target_brand" "$target_fragment" "$build_marker_file" "$ALLOW_STALE_APK_FALLBACK")
+
+      if [[ ${#target_apks[@]} -gt 0 ]]; then
+        total_target_apk_count=$((total_target_apk_count + ${#target_apks[@]}))
+        log "APK files for target $target_key (${target_module}:assemble${target_variant}):"
+        printf '%s\n' "${target_apks[@]}"
+      else
+        log "No APK files found for target $target_key (${target_module}:assemble${target_variant})"
+      fi
+
+      target_distribution_enabled="false"
+      if is_truthy "$ENABLE_DISTRIBUTION" && is_target_distribution_enabled "$target_key"; then
+        target_distribution_enabled="true"
+      fi
+
+      if [[ "${target_distribution_enabled}" == "true" ]]; then
+        if ! is_truthy "$DRY_RUN" && is_truthy "$FAIL_IF_APK_NOT_FOUND" && [[ ${#target_apks[@]} -eq 0 ]]; then
+          warn "APK missing for required distribution target $target_key"
+          return 24
+        fi
+
+        if [[ ${#target_apks[@]} -eq 0 ]]; then
+          continue
+        fi
+
+        app_id="$(resolve_target_app_id "$target_key" "$target_module" "$target_brand")"
+        if [[ -z "$app_id" ]]; then
+          warn "Cannot resolve Firebase app id for target $target_key"
+          return 25
+        fi
+
+        target_groups_raw="$(resolve_target_groups "$target_key" "$target_module" "$target_brand")"
+        target_testers_raw="$(resolve_target_testers "$target_key" "$target_module" "$target_brand")"
+        groups_effective="$(csv_merge_unique "$FIREBASE_DISTRIBUTION_GROUP_ALIAS" "$target_groups_raw")"
+        testers_effective="$(csv_merge_unique "$FIREBASE_TESTERS_GLOBAL" "$target_testers_raw")"
+
+        if [[ -n "$groups_effective" || -n "$testers_effective" ]]; then
+          any_recipients_configured="true"
+        fi
+
+        if [[ -n "$FIREBASE_DISTRIBUTION_GROUP_ALIAS" && -n "$testers_effective" ]]; then
+          if ! sync_testers_to_group "$FIREBASE_DISTRIBUTION_GROUP_ALIAS" "$testers_effective"; then
+            return 28
+          fi
+        fi
+
+        distribute_apk_set "$target_key" "$app_id" "$groups_effective" "$testers_effective" "$release_notes" "${target_apks[@]}"
+      else
+        if is_truthy "$ENABLE_DISTRIBUTION"; then
+          log "Distribution disabled for target $target_key"
+        fi
+      fi
+    done
+
+    if [[ "$total_target_apk_count" -eq 0 && ${#build_targets[@]} -gt 0 ]] && ! is_truthy "$DRY_RUN"; then
+      warn "No APK files matched detected build targets"
+      return 26
+    fi
+
+    if is_truthy "$ENABLE_DISTRIBUTION"; then
+      if [[ "$any_recipients_configured" != "true" ]]; then
+        warn "No Firebase groups/testers configured. Distribution may fail if recipients are required."
+      fi
+    else
+      log "Firebase distribution is disabled"
+    fi
+
+    save_state "$STATE_FILE" "$DEPLOY_GIT_BRANCH" "$target_commit" "$target_commit_time"
+    LAST_CYCLE_DID_BUILD="true"
+    log "Build/distribution cycle completed successfully."
+    return 0
+  done
 }
 
 run() {
+  trap on_signal INT TERM
+
   parse_arguments "$@"
 
-  load_env_file "$DEFAULT_CONFIG_FILE"
+  [[ -f "$LOCAL_CONFIG_FILE" ]] || die "Missing .env file at $LOCAL_CONFIG_FILE. Copy from .env.example first."
   load_env_file "$LOCAL_CONFIG_FILE"
-
-  if [[ -n "$CLI_CONFIG_FILE" ]]; then
-    CLI_CONFIG_FILE="$(resolve_path "$CLI_CONFIG_FILE" "$SCRIPT_DIR")"
-    [[ -f "$CLI_CONFIG_FILE" ]] || die "Config file not found: $CLI_CONFIG_FILE"
-    load_env_file "$CLI_CONFIG_FILE"
-  fi
-
-  : "${DEPLOY_GIT_BRANCH:=main}"
-  : "${GITHUB_API_URL:=https://api.github.com}"
-  : "${MAX_PULLS_TO_SCAN:=100}"
-  : "${ANDROID_REPO_PATH:=../ottclouds-android}"
-  : "${STATE_DIR:=.state}"
-  : "${BUILD_COMMAND:=./gradlew :app-mobile:assembleRelease :app-tv:assembleRelease}"
-  : "${MOBILE_APK_OUTPUT_DIR:=app-mobile/build/outputs/apk}"
-  : "${TV_APK_OUTPUT_DIR:=app-tv/build/outputs/apk}"
-  : "${ENABLE_MOBILE_DISTRIBUTION:=true}"
-  : "${ENABLE_TV_DISTRIBUTION:=true}"
-  : "${FAIL_IF_APK_NOT_FOUND:=true}"
-  : "${ALLOW_STALE_APK_FALLBACK:=true}"
-  : "${FIREBASE_CLI_BIN:=firebase}"
-  : "${FIREBASE_APP_ID_MOBILE:=}"
-  : "${FIREBASE_APP_ID_TV:=}"
-  : "${FIREBASE_GROUPS_MOBILE:=}"
-  : "${FIREBASE_GROUPS_TV:=}"
-  : "${FIREBASE_TESTERS_MOBILE:=}"
-  : "${FIREBASE_TESTERS_TV:=}"
-  : "${FIREBASE_RELEASE_NOTES:=}"
-  : "${FIREBASE_RELEASE_NOTES_FILE:=}"
+  log "Loaded configuration from $LOCAL_CONFIG_FILE"
+  apply_legacy_env_compat
 
   if [[ -n "$CLI_BRANCH" ]]; then
     DEPLOY_GIT_BRANCH="$CLI_BRANCH"
+  elif is_truthy "$FORCE_BRANCH_MAIN"; then
+    DEPLOY_GIT_BRANCH="main"
   fi
+
+  if [[ -n "$CLI_INTERVAL" ]]; then
+    CHECK_INTERVAL_SECONDS="$CLI_INTERVAL"
+  fi
+
+  : "${DEPLOY_GIT_BRANCH:?Missing DEPLOY_GIT_BRANCH in .env}"
+  : "${GIT_REMOTE_NAME:?Missing GIT_REMOTE_NAME in .env}"
+  : "${CHECK_INTERVAL_SECONDS:?Missing CHECK_INTERVAL_SECONDS in .env}"
+  : "${ANDROID_REPO_PATH:?Missing ANDROID_REPO_PATH in .env}"
+  : "${STATE_DIR:?Missing STATE_DIR in .env}"
+  : "${MOBILE_APK_OUTPUT_DIR:?Missing MOBILE_APK_OUTPUT_DIR in .env}"
+  : "${TV_APK_OUTPUT_DIR:?Missing TV_APK_OUTPUT_DIR in .env}"
+  : "${FAIL_IF_APK_NOT_FOUND:?Missing FAIL_IF_APK_NOT_FOUND in .env}"
+  : "${ALLOW_STALE_APK_FALLBACK:?Missing ALLOW_STALE_APK_FALLBACK in .env}"
+  : "${MAX_MERGE_COMMITS_SCAN:=20}"
+
+  : "${ENABLE_DISTRIBUTION:=true}"
+  : "${ENABLE_MOBILE_DISTRIBUTION:=true}"
+  : "${ENABLE_VIDEOHUB_TV_DISTRIBUTION:=true}"
+  : "${ENABLE_SERIESHUB_TV_DISTRIBUTION:=true}"
+  : "${ENABLE_LIVEHUB_TV_DISTRIBUTION:=true}"
+
+  : "${FIREBASE_PROJECT_ID:=ottclouds-template-dev-22980}"
+  : "${FIREBASE_CLI_BIN:=firebase}"
+
+  # Auto-filled from Firebase project ottclouds-template-dev-22980.
+  : "${FIREBASE_APP_ID_VIDEOHUB_MOBILE:=1:1029892934873:android:9ef09d394abd1773df42c8}"
+  : "${FIREBASE_APP_ID_VIDEOHUB_TV:=1:1029892934873:android:c8719fc8334c15e7df42c8}"
+  : "${FIREBASE_APP_ID_SERIESHUB_TV:=1:1029892934873:android:8a1c93a5967b1bfbdf42c8}"
+  : "${FIREBASE_APP_ID_LIVEHUB_TV:=1:1029892934873:android:f3e33592987377f8df42c8}"
+  : "${FIREBASE_TARGET_APP_MAP:=}"
+  : "${FIREBASE_TARGET_GROUPS_MAP:=}"
+  : "${FIREBASE_TARGET_TESTERS_MAP:=}"
+
+  : "${FIREBASE_DISTRIBUTION_GROUP_ALIAS:=ottclouds-template}"
+  : "${FIREBASE_DISTRIBUTION_GROUP_NAME:=OTTClouds Template}"
+  : "${FIREBASE_GROUPS_MOBILE:=}"
+  : "${FIREBASE_GROUPS_VIDEOHUB_TV:=}"
+  : "${FIREBASE_GROUPS_SERIESHUB_TV:=}"
+  : "${FIREBASE_GROUPS_LIVEHUB_TV:=}"
+
+  : "${FIREBASE_TESTERS_GLOBAL:=}"
+  : "${FIREBASE_TESTERS_MOBILE:=}"
+  : "${FIREBASE_TESTERS_VIDEOHUB_TV:=}"
+  : "${FIREBASE_TESTERS_SERIESHUB_TV:=}"
+  : "${FIREBASE_TESTERS_LIVEHUB_TV:=}"
+
+  : "${FIREBASE_RELEASE_NOTES:=}"
+  : "${FIREBASE_RELEASE_NOTES_FILE:=}"
+  : "${FIREBASE_TOKEN:=}"
+  : "${GOOGLE_APPLICATION_CREDENTIALS:=}"
+
+  normalize_distribution_group_alias
+
+  [[ "$CHECK_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || die "CHECK_INTERVAL_SECONDS must be an integer"
+  [[ "$CHECK_INTERVAL_SECONDS" -gt 0 ]] || die "CHECK_INTERVAL_SECONDS must be greater than 0"
+  [[ "$MAX_MERGE_COMMITS_SCAN" =~ ^[0-9]+$ ]] || die "MAX_MERGE_COMMITS_SCAN must be an integer"
+  [[ "$MAX_MERGE_COMMITS_SCAN" -gt 0 ]] || die "MAX_MERGE_COMMITS_SCAN must be greater than 0"
 
   ANDROID_REPO_PATH="$(resolve_path "$ANDROID_REPO_PATH" "$SCRIPT_DIR")"
   STATE_DIR="$(resolve_path "$STATE_DIR" "$SCRIPT_DIR")"
   mkdir -p "$STATE_DIR"
+  EFFECTIVE_BUILD_COMMAND_TV="$(normalize_build_command "${BUILD_COMMAND_TV:-}")"
+  EFFECTIVE_BUILD_COMMAND_TV="$(trim_value "$EFFECTIVE_BUILD_COMMAND_TV")"
 
-  STATE_FILE="$STATE_DIR/${DEPLOY_GIT_BRANCH//\//_}.json"
+  EFFECTIVE_BUILD_COMMAND_MOBILE="$(normalize_build_command "${BUILD_COMMAND_MOBILE:-}")"
+  EFFECTIVE_BUILD_COMMAND_MOBILE="$(trim_value "$EFFECTIVE_BUILD_COMMAND_MOBILE")"
 
-  if [[ ! -d "$ANDROID_REPO_PATH/.git" ]]; then
-    die "ANDROID_REPO_PATH is not a git repo: $ANDROID_REPO_PATH"
-  fi
+  STATE_FILE="$STATE_DIR/${DEPLOY_GIT_BRANCH//\//_}.state"
+
+  [[ -d "$ANDROID_REPO_PATH/.git" ]] || die "ANDROID_REPO_PATH is not a git repo: $ANDROID_REPO_PATH"
 
   require_command git
-  require_command curl
-  require_command jq
   require_command find
-
-  if ! is_truthy "$DRY_RUN"; then
-    if is_truthy "$ENABLE_MOBILE_DISTRIBUTION" || is_truthy "$ENABLE_TV_DISTRIBUTION"; then
-      require_command "$FIREBASE_CLI_BIN"
-    fi
+  ensure_java_runtime
+  if is_truthy "$ENABLE_DISTRIBUTION"; then
+    require_command jq
   fi
 
-  if [[ -z "${GITHUB_OWNER:-}" || -z "${GITHUB_REPO:-}" ]]; then
-    parse_owner_repo_from_remote "$ANDROID_REPO_PATH"
+  setup_firebase_auth
+
+  if ! is_truthy "$DRY_RUN" && is_truthy "$ENABLE_DISTRIBUTION"; then
+    require_command "$FIREBASE_CLI_BIN"
+    firebase_auth_preflight
   fi
 
   if is_truthy "$PRINT_CONFIG"; then
     print_config
   fi
 
-  has_real_merged_pr="false"
-  if is_truthy "$FORCE_BUILD"; then
-    latest_pr_number="manual"
-    latest_pr_title="Manual force build"
-    latest_pr_url="N/A"
-    latest_pr_merged_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-    log "Force build mode: skip merged PR query."
-  else
-    log "Checking merged PRs for $GITHUB_OWNER/$GITHUB_REPO on branch $DEPLOY_GIT_BRANCH"
-    closed_prs_json="$(github_api_get_closed_prs "$GITHUB_OWNER" "$GITHUB_REPO" "$DEPLOY_GIT_BRANCH")"
-    latest_pr="$(latest_merged_pr_json "$closed_prs_json" "$DEPLOY_GIT_BRANCH")"
-    if [[ -z "$latest_pr" ]]; then
-      log "No merged PR found on branch $DEPLOY_GIT_BRANCH"
-      exit 0
+  log "Branch listener started: $GIT_REMOTE_NAME/$DEPLOY_GIT_BRANCH"
+  log "Check interval: ${CHECK_INTERVAL_SECONDS}s"
+
+  local force_next_cycle="$FORCE_BUILD"
+  while true; do
+    if is_truthy "$SHUTDOWN_REQUESTED"; then
+      log "Shutdown completed. Exiting listener."
+      break
     fi
 
-    has_real_merged_pr="true"
-    latest_pr_number="$(printf '%s' "$latest_pr" | jq -r '.number')"
-    latest_pr_title="$(printf '%s' "$latest_pr" | jq -r '.title')"
-    latest_pr_url="$(printf '%s' "$latest_pr" | jq -r '.html_url')"
-    latest_pr_merged_at="$(printf '%s' "$latest_pr" | jq -r '.merged_at')"
-  fi
-
-  if [[ -z "${latest_pr_number:-}" || -z "${latest_pr_merged_at:-}" ]]; then
-    if is_truthy "$FORCE_BUILD"; then
-      latest_pr_number="manual"
-      latest_pr_title="Manual force build"
-      latest_pr_url="N/A"
-      latest_pr_merged_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    if run_single_cycle "$force_next_cycle"; then
+      force_next_cycle="false"
     else
-      die "Unable to read merged PR metadata."
-    fi
-  fi
-
-  last_processed_pr_number="$(read_state_value 'last_processed_pr_number' "$STATE_FILE")"
-  last_processed_pr_merged_at="$(read_state_value 'last_processed_pr_merged_at' "$STATE_FILE")"
-
-  if ! is_truthy "$FORCE_BUILD" && is_truthy "$has_real_merged_pr"; then
-    if [[ -n "$last_processed_pr_merged_at" ]]; then
-      if [[ "$latest_pr_merged_at" < "$last_processed_pr_merged_at" || "$latest_pr_merged_at" == "$last_processed_pr_merged_at" ]]; then
-        if [[ "$latest_pr_number" == "$last_processed_pr_number" ]]; then
-          log "No new merged PR since last run (last processed PR #$last_processed_pr_number)"
-          exit 0
-        fi
+      local cycle_status=$?
+      if [[ "$cycle_status" -eq 130 ]]; then
+        log "Listener stopped by signal."
+        break
+      fi
+      warn "Cycle ended with error code $cycle_status"
+      force_next_cycle="false"
+      if is_truthy "$RUN_ONCE"; then
+        exit "$cycle_status"
       fi
     fi
-  fi
 
-  if is_truthy "$FORCE_BUILD"; then
-    log "Force build enabled. Skip PR freshness check."
-  else
-    log "New merged PR detected: #$latest_pr_number - $latest_pr_title"
-  fi
-
-  build_marker_file="$STATE_DIR/build_marker"
-  touch "$build_marker_file"
-
-  run_build "$ANDROID_REPO_PATH" "$BUILD_COMMAND"
-
-  mobile_output_dir="$(resolve_path "$MOBILE_APK_OUTPUT_DIR" "$ANDROID_REPO_PATH")"
-  tv_output_dir="$(resolve_path "$TV_APK_OUTPUT_DIR" "$ANDROID_REPO_PATH")"
-
-  mobile_apks=()
-  while IFS= read -r apk_file; do
-    [[ -n "$apk_file" ]] && mobile_apks+=("$apk_file")
-  done < <(collect_apks "$mobile_output_dir" "$build_marker_file" "$ALLOW_STALE_APK_FALLBACK")
-
-  tv_apks=()
-  while IFS= read -r apk_file; do
-    [[ -n "$apk_file" ]] && tv_apks+=("$apk_file")
-  done < <(collect_apks "$tv_output_dir" "$build_marker_file" "$ALLOW_STALE_APK_FALLBACK")
-
-  if ! is_truthy "$DRY_RUN"; then
-    if is_truthy "$ENABLE_MOBILE_DISTRIBUTION" && [[ ${#mobile_apks[@]} -eq 0 ]] && is_truthy "$FAIL_IF_APK_NOT_FOUND"; then
-      die "No APK files found for mobile in $mobile_output_dir"
+    if is_truthy "$RUN_ONCE"; then
+      log "Run-once mode completed."
+      break
     fi
 
-    if is_truthy "$ENABLE_TV_DISTRIBUTION" && [[ ${#tv_apks[@]} -eq 0 ]] && is_truthy "$FAIL_IF_APK_NOT_FOUND"; then
-      die "No APK files found for TV in $tv_output_dir"
+    if is_truthy "$LAST_CYCLE_DID_BUILD" && ! is_truthy "$DRY_RUN"; then
+      log "Build finished. Checking branch again immediately..."
+      continue
     fi
 
-    if [[ ${#mobile_apks[@]} -eq 0 && ${#tv_apks[@]} -eq 0 ]]; then
-      die "No APK files found after build"
-    fi
-  else
-    if [[ ${#mobile_apks[@]} -eq 0 ]]; then
-      log "[DRY-RUN] No mobile APK found yet in $mobile_output_dir"
-    fi
-
-    if [[ ${#tv_apks[@]} -eq 0 ]]; then
-      log "[DRY-RUN] No TV APK found yet in $tv_output_dir"
-    fi
-  fi
-
-  if is_truthy "$has_real_merged_pr"; then
-    default_release_notes="Automated distribution from merged PR #$latest_pr_number\nTitle: $latest_pr_title\nURL: $latest_pr_url\nMerged at: $latest_pr_merged_at"
-  else
-    default_release_notes="Automated distribution from manual force build\nBranch: $DEPLOY_GIT_BRANCH\nTriggered at: $latest_pr_merged_at"
-  fi
-  release_notes="$(read_release_notes "$default_release_notes")"
-
-  if is_truthy "$ENABLE_MOBILE_DISTRIBUTION"; then
-    if [[ ${#mobile_apks[@]} -gt 0 ]]; then
-      distribute_apks "mobile" "$FIREBASE_APP_ID_MOBILE" "$FIREBASE_GROUPS_MOBILE" "$FIREBASE_TESTERS_MOBILE" "$release_notes" "${mobile_apks[@]}"
-    else
-      distribute_apks "mobile" "$FIREBASE_APP_ID_MOBILE" "$FIREBASE_GROUPS_MOBILE" "$FIREBASE_TESTERS_MOBILE" "$release_notes"
-    fi
-  else
-    log "Mobile distribution is disabled"
-  fi
-
-  if is_truthy "$ENABLE_TV_DISTRIBUTION"; then
-    if [[ ${#tv_apks[@]} -gt 0 ]]; then
-      distribute_apks "tv" "$FIREBASE_APP_ID_TV" "$FIREBASE_GROUPS_TV" "$FIREBASE_TESTERS_TV" "$release_notes" "${tv_apks[@]}"
-    else
-      distribute_apks "tv" "$FIREBASE_APP_ID_TV" "$FIREBASE_GROUPS_TV" "$FIREBASE_TESTERS_TV" "$release_notes"
-    fi
-  else
-    log "TV distribution is disabled"
-  fi
-
-  if is_truthy "$has_real_merged_pr"; then
-    save_state "$STATE_FILE" "$DEPLOY_GIT_BRANCH" "$latest_pr_number" "$latest_pr_merged_at" "$latest_pr_url"
-  else
-    log "Skip state update because this run was not triggered by a merged PR"
-  fi
-
-  log "Pipeline completed successfully"
+    log "Waiting ${CHECK_INTERVAL_SECONDS}s before next check..."
+    sleep "$CHECK_INTERVAL_SECONDS"
+  done
 }
 
 run "$@"
