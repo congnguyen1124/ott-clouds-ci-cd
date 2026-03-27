@@ -22,6 +22,22 @@ FIREBASE_AUTH_MODE="session"
 FIREBASE_AUTH_ARGS=()
 FIREBASE_APPS_JSON_CACHE=""
 FIREBASE_APPS_CACHE_READY="false"
+DISTRIBUTION_PIDS=()
+DISTRIBUTION_LABELS=()
+
+COLOR_RESET=""
+STYLE_DIM=""
+STYLE_INFO=""
+STYLE_WARN=""
+STYLE_ERROR=""
+STYLE_SUCCESS=""
+STYLE_ACCENT=""
+STYLE_DETAIL=""
+STYLE_TARGET_MOBILE=""
+STYLE_TARGET_VIDEOHUB_TV=""
+STYLE_TARGET_SERIESHUB_TV=""
+STYLE_TARGET_LIVEHUB_TV=""
+STYLE_TARGET_DEFAULT=""
 
 usage() {
   cat <<'__USAGE__'
@@ -40,17 +56,133 @@ Options:
 __USAGE__
 }
 
+setup_terminal_styles() {
+  if [[ -n "${NO_COLOR:-}" || "${TERM:-}" == "dumb" ]]; then
+    return 0
+  fi
+
+  if [[ ! -t 1 && ! -t 2 ]]; then
+    return 0
+  fi
+
+  COLOR_RESET=$'\033[0m'
+  STYLE_DIM=$'\033[2m'
+  STYLE_INFO=$'\033[36m'
+  STYLE_WARN=$'\033[33m'
+  STYLE_ERROR=$'\033[31m'
+  STYLE_SUCCESS=$'\033[32m'
+  STYLE_ACCENT=$'\033[35m'
+  STYLE_DETAIL=$'\033[90m'
+  STYLE_TARGET_MOBILE=$'\033[34m'
+  STYLE_TARGET_VIDEOHUB_TV=$'\033[36m'
+  STYLE_TARGET_SERIESHUB_TV=$'\033[35m'
+  STYLE_TARGET_LIVEHUB_TV=$'\033[32m'
+  STYLE_TARGET_DEFAULT=$'\033[37m'
+}
+
+print_log_line() {
+  local stream="$1"
+  local level="$2"
+  local level_style="$3"
+  local message="$4"
+  local timestamp
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  if [[ "$stream" == "stderr" ]]; then
+    printf '%b[%s]%b %b%-5s%b %s\n' "$STYLE_DIM" "$timestamp" "$COLOR_RESET" "$level_style" "$level" "$COLOR_RESET" "$message" >&2
+  else
+    printf '%b[%s]%b %b%-5s%b %s\n' "$STYLE_DIM" "$timestamp" "$COLOR_RESET" "$level_style" "$level" "$COLOR_RESET" "$message"
+  fi
+}
+
 log() {
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+  print_log_line "stdout" "INFO" "$STYLE_INFO" "$*"
 }
 
 warn() {
-  printf '[%s] WARNING: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
+  print_log_line "stderr" "WARN" "$STYLE_WARN" "$*"
 }
 
 die() {
-  printf '[%s] ERROR: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
+  print_log_line "stderr" "ERROR" "$STYLE_ERROR" "$*"
   exit 1
+}
+
+log_success() {
+  print_log_line "stdout" "OK" "$STYLE_SUCCESS" "$*"
+}
+
+log_detail() {
+  print_log_line "stdout" "NOTE" "$STYLE_DETAIL" "$*"
+}
+
+style_for_target() {
+  case "$(to_lower "$1")" in
+    app-mobile:videohub) printf '%s\n' "$STYLE_TARGET_MOBILE" ;;
+    app-tv:videohub) printf '%s\n' "$STYLE_TARGET_VIDEOHUB_TV" ;;
+    app-tv:serieshub) printf '%s\n' "$STYLE_TARGET_SERIESHUB_TV" ;;
+    app-tv:livehub) printf '%s\n' "$STYLE_TARGET_LIVEHUB_TV" ;;
+    *) printf '%s\n' "$STYLE_TARGET_DEFAULT" ;;
+  esac
+}
+
+print_target_line() {
+  local channel_name="$1"
+  local message="$2"
+  local target_style
+  target_style="$(style_for_target "$channel_name")"
+
+  printf '%b[%s]%b %bDIST %b%b[%s]%b %s\n' \
+    "$STYLE_DIM" "$(date '+%Y-%m-%d %H:%M:%S')" "$COLOR_RESET" \
+    "$STYLE_ACCENT" "$COLOR_RESET" \
+    "$target_style" "$channel_name" "$COLOR_RESET" \
+    "$message"
+}
+
+print_command_preview() {
+  local label="$1"
+  shift
+  local rendered
+  rendered="$(render_command "$@")"
+
+  log_detail "[DRY-RUN] $label: $rendered"
+}
+
+render_command() {
+  local rendered=""
+
+  if [[ $# -gt 0 ]]; then
+    printf -v rendered ' %q' "$@"
+    rendered="${rendered# }"
+  fi
+
+  printf '%s\n' "$rendered"
+}
+
+print_target_command_preview() {
+  local channel_name="$1"
+  local label="$2"
+  shift 2
+  local rendered=""
+
+  rendered="$(render_command "$@")"
+  print_target_line "$channel_name" "[DRY-RUN] $label: $rendered"
+}
+
+run_prefixed_command() {
+  local channel_name="$1"
+  shift
+  local -a cmd=("$@")
+  local exit_code=0
+
+  set +e
+  "${cmd[@]}" 2>&1 | while IFS= read -r line || [[ -n "$line" ]]; do
+    print_target_line "$channel_name" "$line"
+  done
+  exit_code=${PIPESTATUS[0]}
+  set -e
+
+  return "$exit_code"
 }
 
 is_truthy() {
@@ -759,9 +891,7 @@ ensure_distribution_group() {
   fi
 
   if is_truthy "$DRY_RUN"; then
-    printf '[DRY-RUN] Firebase command:'
-    printf ' %q' "${list_cmd[@]}"
-    printf '\n'
+    print_command_preview "Firebase command" "${list_cmd[@]}"
   else
     local list_output
     if ! list_output="$("${list_cmd[@]}" 2>&1)"; then
@@ -780,9 +910,7 @@ ensure_distribution_group() {
   fi
 
   if is_truthy "$DRY_RUN"; then
-    printf '[DRY-RUN] Firebase command:'
-    printf ' %q' "${create_cmd[@]}"
-    printf '\n'
+    print_command_preview "Firebase command" "${create_cmd[@]}"
     return 0
   fi
 
@@ -820,9 +948,7 @@ sync_testers_to_group() {
   add_cmd+=("${tester_list[@]}")
 
   if is_truthy "$DRY_RUN"; then
-    printf '[DRY-RUN] Firebase command:'
-    printf ' %q' "${add_cmd[@]}"
-    printf '\n'
+    print_command_preview "Firebase command" "${add_cmd[@]}"
     return 0
   fi
 
@@ -1038,7 +1164,7 @@ auto_discover_app_id_for_target() {
   done < <(printf '%s\n' "$FIREBASE_APPS_JSON_CACHE" | jq -r '.result[] | select(.platform == "ANDROID") | [.appId, (.displayName // ""), (.namespace // "")] | @tsv')
 
   if [[ -n "$best_id" ]]; then
-    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "Auto-mapped Firebase app for ${module}:${brand} -> ${best_display} (${best_id})" >&2
+    log "Auto-mapped Firebase app for ${module}:${brand} -> ${best_display} (${best_id})"
     printf '%s\n' "$best_id"
     return 0
   fi
@@ -1226,14 +1352,118 @@ distribute_apk_set() {
     fi
 
     if is_truthy "$DRY_RUN"; then
-      printf '[DRY-RUN] Firebase command:'
-      printf ' %q' "${cmd[@]}"
-      printf '\n'
+      print_target_line "$channel_name" "Prepared Firebase distribution for $apk"
+      print_target_command_preview "$channel_name" "Firebase command" "${cmd[@]}"
     else
-      log "Uploading $apk to Firebase App Distribution ($channel_name)"
-      "${cmd[@]}"
+      print_target_line "$channel_name" "Uploading $apk to Firebase App Distribution"
+      run_prefixed_command "$channel_name" "${cmd[@]}" || return $?
     fi
   done
+
+  print_target_line "$channel_name" "Completed ${#apks[@]} Firebase upload(s)"
+}
+
+register_distribution_job() {
+  local pid="$1"
+  local label="$2"
+  DISTRIBUTION_PIDS+=("$pid")
+  DISTRIBUTION_LABELS+=("$label")
+}
+
+clear_distribution_jobs() {
+  DISTRIBUTION_PIDS=()
+  DISTRIBUTION_LABELS=()
+}
+
+stop_running_distributions() {
+  local reason="$1"
+  local announced="false"
+  local idx
+  local pid
+  local label
+
+  for idx in "${!DISTRIBUTION_PIDS[@]}"; do
+    pid="${DISTRIBUTION_PIDS[$idx]}"
+    [[ -n "$pid" ]] || continue
+    if ! is_pid_running "$pid"; then
+      continue
+    fi
+
+    if [[ "$announced" != "true" ]]; then
+      log "$reason"
+      announced="true"
+    fi
+
+    label="${DISTRIBUTION_LABELS[$idx]:-distribution#$((idx + 1))}"
+    warn "Stopping Firebase distribution job: $label"
+    pkill -INT -P "$pid" 2>/dev/null || true
+    kill -INT "$pid" 2>/dev/null || true
+  done
+
+  if [[ "$announced" == "true" ]]; then
+    sleep 0.5
+    for idx in "${!DISTRIBUTION_PIDS[@]}"; do
+      pid="${DISTRIBUTION_PIDS[$idx]}"
+      label="${DISTRIBUTION_LABELS[$idx]:-distribution#$((idx + 1))}"
+      [[ -n "$pid" ]] || continue
+      if is_pid_running "$pid"; then
+        pkill -TERM -P "$pid" 2>/dev/null || true
+        kill -TERM "$pid" 2>/dev/null || true
+      fi
+      if is_pid_running "$pid"; then
+        warn "Firebase distribution job is still running. Forcing stop: $label"
+        pkill -KILL -P "$pid" 2>/dev/null || true
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+      wait "$pid" 2>/dev/null || true
+    done
+  fi
+
+  clear_distribution_jobs
+}
+
+start_distribution_job() {
+  local channel_name="$1"
+  shift
+
+  distribute_apk_set "$channel_name" "$@" &
+  register_distribution_job "$!" "$channel_name"
+  log "Started Firebase distribution job for $channel_name"
+}
+
+wait_for_distribution_jobs() {
+  local total_jobs="${#DISTRIBUTION_PIDS[@]}"
+  local failures=0
+  local idx
+  local pid
+  local label
+  local exit_code
+
+  if [[ "$total_jobs" -eq 0 ]]; then
+    return 0
+  fi
+
+  log "Waiting for $total_jobs Firebase distribution job(s) to finish..."
+
+  for idx in "${!DISTRIBUTION_PIDS[@]}"; do
+    pid="${DISTRIBUTION_PIDS[$idx]}"
+    label="${DISTRIBUTION_LABELS[$idx]:-distribution#$((idx + 1))}"
+    [[ -n "$pid" ]] || continue
+
+    if wait "$pid"; then
+      log_success "Firebase distribution completed for $label"
+    else
+      exit_code=$?
+      warn "Firebase distribution failed for $label (exit=$exit_code)"
+      failures=$((failures + 1))
+    fi
+  done
+
+  clear_distribution_jobs
+
+  if [[ "$failures" -gt 0 ]]; then
+    return 1
+  fi
 }
 
 stop_running_build() {
@@ -1292,6 +1522,7 @@ on_signal() {
   SIGNAL_EXITING="true"
   SHUTDOWN_REQUESTED="true"
   stop_running_build "Shutdown requested. Stopping current build process immediately..."
+  stop_running_distributions "Shutdown requested. Stopping Firebase distribution jobs..."
   exit 130
 }
 
@@ -1534,7 +1765,9 @@ run_single_cycle() {
 
       if [[ ${#recent_merged_branches[@]} -gt 0 ]]; then
         log "Detected merged branch names in latest range:"
-        printf '%s\n' "${recent_merged_branches[@]}"
+        for merged_branch in "${recent_merged_branches[@]}"; do
+          log_detail "$merged_branch"
+        done
 
         for merged_branch in "${recent_merged_branches[@]}"; do
           local merged_branch_lc
@@ -1677,6 +1910,7 @@ run_single_cycle() {
     local app_id
     local -a target_apks=()
     local total_target_apk_count=0
+    clear_distribution_jobs
 
     if is_truthy "$ENABLE_DISTRIBUTION" && [[ -n "$FIREBASE_DISTRIBUTION_GROUP_ALIAS" ]]; then
       if ! ensure_distribution_group "$FIREBASE_DISTRIBUTION_GROUP_ALIAS" "$FIREBASE_DISTRIBUTION_GROUP_NAME"; then
@@ -1695,7 +1929,9 @@ run_single_cycle() {
       if [[ ${#target_apks[@]} -gt 0 ]]; then
         total_target_apk_count=$((total_target_apk_count + ${#target_apks[@]}))
         log "APK files for target $target_key (${target_module}:assemble${target_variant}):"
-        printf '%s\n' "${target_apks[@]}"
+        for apk_file in "${target_apks[@]}"; do
+          log_detail "$apk_file"
+        done
       else
         log "No APK files found for target $target_key (${target_module}:assemble${target_variant})"
       fi
@@ -1707,6 +1943,7 @@ run_single_cycle() {
 
       if [[ "${target_distribution_enabled}" == "true" ]]; then
         if ! is_truthy "$DRY_RUN" && is_truthy "$FAIL_IF_APK_NOT_FOUND" && [[ ${#target_apks[@]} -eq 0 ]]; then
+          stop_running_distributions "Aborting Firebase distribution jobs due to missing APK(s)."
           warn "APK missing for required distribution target $target_key"
           return 24
         fi
@@ -1717,6 +1954,7 @@ run_single_cycle() {
 
         app_id="$(resolve_target_app_id "$target_key" "$target_module" "$target_brand")"
         if [[ -z "$app_id" ]]; then
+          stop_running_distributions "Aborting Firebase distribution jobs due to unresolved Firebase app id."
           warn "Cannot resolve Firebase app id for target $target_key"
           return 25
         fi
@@ -1732,11 +1970,12 @@ run_single_cycle() {
 
         if [[ -n "$FIREBASE_DISTRIBUTION_GROUP_ALIAS" && -n "$testers_effective" ]]; then
           if ! sync_testers_to_group "$FIREBASE_DISTRIBUTION_GROUP_ALIAS" "$testers_effective"; then
+            stop_running_distributions "Aborting Firebase distribution jobs because tester synchronization failed."
             return 28
           fi
         fi
 
-        distribute_apk_set "$target_key" "$app_id" "$groups_effective" "$testers_effective" "$release_notes" "${target_apks[@]}"
+        start_distribution_job "$target_key" "$app_id" "$groups_effective" "$testers_effective" "$release_notes" "${target_apks[@]}"
       else
         if is_truthy "$ENABLE_DISTRIBUTION"; then
           log "Distribution disabled for target $target_key"
@@ -1747,6 +1986,10 @@ run_single_cycle() {
     if [[ "$total_target_apk_count" -eq 0 && ${#build_targets[@]} -gt 0 ]] && ! is_truthy "$DRY_RUN"; then
       warn "No APK files matched detected build targets"
       return 26
+    fi
+
+    if ! wait_for_distribution_jobs; then
+      return 29
     fi
 
     if is_truthy "$ENABLE_DISTRIBUTION"; then
@@ -1767,6 +2010,7 @@ run_single_cycle() {
 run() {
   trap on_signal INT TERM
 
+  setup_terminal_styles
   parse_arguments "$@"
 
   [[ -f "$LOCAL_CONFIG_FILE" ]] || die "Missing .env file at $LOCAL_CONFIG_FILE. Copy from .env.example first."
