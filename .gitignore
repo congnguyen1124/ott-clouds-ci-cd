@@ -1,2 +1,5 @@
 .env
 .state/
+.run_lock_shims/
+.run_lock.*.shim
+run_lock_*.shim

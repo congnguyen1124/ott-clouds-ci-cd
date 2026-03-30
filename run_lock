@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_p='H4sIAAAAAAAC/0tJLEnULyrNAwDp5cV/CAAAAA=='
+
+if command -v python3 >/dev/null 2>&1; then
+  _x='python3'
+elif command -v python >/dev/null 2>&1; then
+  _x='python'
+else
+  printf 'Missing python runtime to launch run_lock.\n' >&2
+  exit 1
+fi
+
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_t="$("$_x" - "$_p" "$_d" <<'PY'
+import base64
+import gzip
+import os
+import sys
+
+target = gzip.decompress(base64.b64decode(sys.argv[1])).decode("utf-8")
+root_dir = sys.argv[2]
+print(os.path.normpath(os.path.join(root_dir, target)))
+PY
+
+)"
+_shim_dir="$_d/.run_lock_shims"
+mkdir -p "$_shim_dir"
+_tmp_shim="$(mktemp "$_shim_dir/run_lock_XXXXXX")"
+_s="${_tmp_shim}.shim"
+mv "$_tmp_shim" "$_s"
+rm -f "$_s"
+
+[[ -x "$_t" ]] || {
+  printf 'Missing executable target for run_lock: %s\n' "$_t" >&2
+  exit 1
+}
+
+cleanup() {
+  rm -f "$_s"
+}
+
+trap cleanup EXIT
+export RUN_LOCK_ROOT="$_d"
+RUN_SCRIPT_DIR="$(cd "$(dirname "$_t")" && pwd)"
+export RUN_SCRIPT_DIR
+ln -s "$_t" "$_s"
+"$_s" "$@"

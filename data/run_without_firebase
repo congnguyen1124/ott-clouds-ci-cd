@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOCAL_CONFIG_FILE="$SCRIPT_DIR/.env"
+SCRIPT_DIR="${RUN_SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_BASE_DIR="${RUN_LOCK_ROOT:-}"
+
+if [[ -z "$CONFIG_BASE_DIR" ]]; then
+  if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    CONFIG_BASE_DIR="$SCRIPT_DIR"
+  elif [[ -f "$PARENT_DIR/.env" ]]; then
+    CONFIG_BASE_DIR="$PARENT_DIR"
+  else
+    CONFIG_BASE_DIR="$SCRIPT_DIR"
+  fi
+fi
+
+LOCAL_CONFIG_FILE="$CONFIG_BASE_DIR/.env"
 
 CLI_BRANCH=""
 CLI_INTERVAL=""
@@ -26,7 +39,7 @@ Options:
   --branch <name>     Override DEPLOY_GIT_BRANCH
   --interval <sec>    Override CHECK_INTERVAL_SECONDS (default 300)
   --force, --force-build
-                      Build immediately without waiting for new commit
+                      Build TV + mobile immediately without waiting for new commit
   --once              Run one check/build cycle then exit
   --dry-run           Print planned actions without real build
   --print-config      Print effective configuration
@@ -114,6 +127,45 @@ normalize_build_command() {
   printf '%s\n' "$raw_command"
 }
 
+merge_build_commands_single_gradlew() {
+  local first_command
+  local second_command
+  first_command="$(trim_value "${1:-}")"
+  second_command="$(trim_value "${2:-}")"
+
+  local part
+  local token
+  local merged="./gradlew"
+  local seen_tokens=$'\n'
+  local -a tokens=()
+
+  for part in "$first_command" "$second_command"; do
+    [[ -n "$part" ]] || continue
+    read -r -a tokens <<< "${part//$'\n'/ }"
+    for token in "${tokens[@]}"; do
+      case "$token" in
+        "./gradlew"|"gradlew"|"gradle"|"&&"|"||"|";"|"|")
+          continue
+          ;;
+      esac
+
+      if [[ "$seen_tokens" == *$'\n'"$token"$'\n'* ]]; then
+        continue
+      fi
+
+      merged+=" $token"
+      seen_tokens+="${token}"$'\n'
+    done
+  done
+
+  if [[ "$merged" == "./gradlew" ]]; then
+    printf '\n'
+    return 0
+  fi
+
+  printf '%s\n' "$merged"
+}
+
 apply_legacy_env_compat() {
   local legacy_used="false"
   local build_lc=""
@@ -158,7 +210,7 @@ split_variant_parts() {
 
   for suffix in "${suffixes[@]}"; do
     if [[ "$variant" == *"$suffix" && "$variant" != "$suffix" ]]; then
-      flavor="${variant%$suffix}"
+      flavor="${variant%"$suffix"}"
       build_type="$(to_lower "$suffix")"
       printf '%s|%s\n' "$flavor" "$build_type"
       return 0
@@ -194,7 +246,7 @@ extract_brand_key() {
     changed="false"
     for suffix in "${suffixes[@]}"; do
       if [[ "$flavor_lc" == *"$suffix" && ${#flavor_lc} -gt ${#suffix} ]]; then
-        flavor_lc="${flavor_lc%$suffix}"
+        flavor_lc="${flavor_lc%"$suffix"}"
         changed="true"
         break
       fi
@@ -827,29 +879,35 @@ run_single_cycle() {
     log "Commit title : $target_commit_subject"
 
     local -a recent_merged_branches=()
-    local merged_branch
-    while IFS= read -r merged_branch; do
-      [[ -n "$merged_branch" ]] && recent_merged_branches+=("$merged_branch")
-    done < <(list_recent_merged_branches "$ANDROID_REPO_PATH" "$baseline_commit" "$target_commit" "$MAX_MERGE_COMMITS_SCAN")
-
     local should_build_tv="false"
     local should_build_mobile="false"
-    if [[ ${#recent_merged_branches[@]} -gt 0 ]]; then
-      log "Detected merged branch names in latest range:"
-      printf '%s\n' "${recent_merged_branches[@]}"
-
-      for merged_branch in "${recent_merged_branches[@]}"; do
-        local merged_branch_lc
-        merged_branch_lc="$(to_lower "$merged_branch")"
-        if [[ "$merged_branch_lc" == *"app-tv"* ]]; then
-          should_build_tv="true"
-        fi
-        if [[ "$merged_branch_lc" == *"app-mobile"* ]]; then
-          should_build_mobile="true"
-        fi
-      done
+    local merged_branch
+    if is_truthy "$force_this_cycle"; then
+      should_build_tv="true"
+      should_build_mobile="true"
+      log "Force mode enabled. Build both TV and mobile apps from configured branch $DEPLOY_GIT_BRANCH."
     else
-      log "No merge-branch name detected from recent merge commits."
+      while IFS= read -r merged_branch; do
+        [[ -n "$merged_branch" ]] && recent_merged_branches+=("$merged_branch")
+      done < <(list_recent_merged_branches "$ANDROID_REPO_PATH" "$baseline_commit" "$target_commit" "$MAX_MERGE_COMMITS_SCAN")
+
+      if [[ ${#recent_merged_branches[@]} -gt 0 ]]; then
+        log "Detected merged branch names in latest range:"
+        printf '%s\n' "${recent_merged_branches[@]}"
+
+        for merged_branch in "${recent_merged_branches[@]}"; do
+          local merged_branch_lc
+          merged_branch_lc="$(to_lower "$merged_branch")"
+          if [[ "$merged_branch_lc" == *"app-tv"* ]]; then
+            should_build_tv="true"
+          fi
+          if [[ "$merged_branch_lc" == *"app-mobile"* ]]; then
+            should_build_mobile="true"
+          fi
+        done
+      else
+        log "No merge-branch name detected from recent merge commits."
+      fi
     fi
 
     if [[ "$should_build_tv" != "true" && "$should_build_mobile" != "true" ]]; then
@@ -863,7 +921,11 @@ run_single_cycle() {
     if [[ "$should_build_tv" == "true" ]]; then
       [[ -n "$EFFECTIVE_BUILD_COMMAND_TV" ]] || die "BUILD_COMMAND_TV is empty. Please set BUILD_COMMAND_TV in .env."
       selected_effective_build_command="$EFFECTIVE_BUILD_COMMAND_TV"
-      log "Trigger TV build due to merged branch keyword 'app-tv'."
+      if is_truthy "$force_this_cycle"; then
+        log "Trigger TV build in force mode."
+      else
+        log "Trigger TV build due to merged branch keyword 'app-tv'."
+      fi
     fi
     if [[ "$should_build_mobile" == "true" ]]; then
       [[ -n "$EFFECTIVE_BUILD_COMMAND_MOBILE" ]] || die "BUILD_COMMAND_MOBILE is empty. Please set BUILD_COMMAND_MOBILE in .env."
@@ -872,7 +934,18 @@ run_single_cycle() {
       else
         selected_effective_build_command="$EFFECTIVE_BUILD_COMMAND_MOBILE"
       fi
-      log "Trigger mobile build due to merged branch keyword 'app-mobile'."
+      if is_truthy "$force_this_cycle"; then
+        log "Trigger mobile build in force mode."
+      else
+        log "Trigger mobile build due to merged branch keyword 'app-mobile'."
+      fi
+    fi
+
+    if is_truthy "$force_this_cycle" && [[ "$should_build_tv" == "true" && "$should_build_mobile" == "true" ]]; then
+      selected_effective_build_command="$(merge_build_commands_single_gradlew "$EFFECTIVE_BUILD_COMMAND_TV" "$EFFECTIVE_BUILD_COMMAND_MOBILE")"
+      selected_effective_build_command="$(trim_value "$selected_effective_build_command")"
+      [[ -n "$selected_effective_build_command" ]] || die "Cannot merge BUILD_COMMAND_TV and BUILD_COMMAND_MOBILE for force mode."
+      log "Force mode merged TV + mobile tasks into one Gradle command."
     fi
 
     [[ -n "$selected_effective_build_command" ]] || die "No effective build command selected for current cycle."
@@ -1034,8 +1107,8 @@ run() {
   [[ "$MAX_MERGE_COMMITS_SCAN" =~ ^[0-9]+$ ]] || die "MAX_MERGE_COMMITS_SCAN must be an integer"
   [[ "$MAX_MERGE_COMMITS_SCAN" -gt 0 ]] || die "MAX_MERGE_COMMITS_SCAN must be greater than 0"
 
-  ANDROID_REPO_PATH="$(resolve_path "$ANDROID_REPO_PATH" "$SCRIPT_DIR")"
-  STATE_DIR="$(resolve_path "$STATE_DIR" "$SCRIPT_DIR")"
+  ANDROID_REPO_PATH="$(resolve_path "$ANDROID_REPO_PATH" "$CONFIG_BASE_DIR")"
+  STATE_DIR="$(resolve_path "$STATE_DIR" "$CONFIG_BASE_DIR")"
   mkdir -p "$STATE_DIR"
   EFFECTIVE_BUILD_COMMAND_TV="$(normalize_build_command "${BUILD_COMMAND_TV:-}")"
   EFFECTIVE_BUILD_COMMAND_TV="$(trim_value "$EFFECTIVE_BUILD_COMMAND_TV")"

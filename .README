@@ -77,6 +77,18 @@ Buộc chạy chu kỳ ngay (bỏ qua chờ commit mới):
 ./run --force-build
 ```
 
+Chỉ build/distribute TV ngay:
+
+```bash
+./run --force-tv
+```
+
+Chỉ build/distribute mobile ngay:
+
+```bash
+./run --force-mobile
+```
+
 Chế độ kiểm tra (không build/distribute thật):
 
 ```bash

@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash disable=SC2034
+set -euo pipefail
+
+SCRIPT_DIR="${RUN_SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_BASE_DIR="${RUN_LOCK_ROOT:-}"
+
+if [[ -z "$CONFIG_BASE_DIR" ]]; then
+  if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    CONFIG_BASE_DIR="$SCRIPT_DIR"
+  elif [[ -f "$PARENT_DIR/.env" ]]; then
+    CONFIG_BASE_DIR="$PARENT_DIR"
+  else
+    CONFIG_BASE_DIR="$SCRIPT_DIR"
+  fi
+fi
+
+LOCAL_CONFIG_FILE="$CONFIG_BASE_DIR/.env"
+
+CLI_BRANCH=""
+CLI_INTERVAL=""
+FORCE_BUILD="false"
+FORCE_BUILD_SCOPE="auto"
+DRY_RUN="false"
+PRINT_CONFIG="false"
+RUN_ONCE="false"
+
+BUILD_PID=""
+BUILD_PGID=""
+SHUTDOWN_REQUESTED="false"
+SIGNAL_EXITING="false"
+PREEMPT_COMMIT=""
+LAST_CYCLE_DID_BUILD="false"
+FIREBASE_AUTH_MODE="session"
+FIREBASE_AUTH_ARGS=()
+FIREBASE_APPS_JSON_CACHE=""
+FIREBASE_APPS_CACHE_READY="false"
+DISTRIBUTION_PIDS=()
+DISTRIBUTION_LABELS=()
+NOTES_JOB_PID=""
+NOTES_JOB_OUTPUT_FILE=""
+
+COLOR_RESET=""
+STYLE_DIM=""
+STYLE_INFO=""
+STYLE_WARN=""
+STYLE_ERROR=""
+STYLE_SUCCESS=""
+STYLE_ACCENT=""
+STYLE_DETAIL=""
+STYLE_TARGET_MOBILE=""
+STYLE_TARGET_VIDEOHUB_TV=""
+STYLE_TARGET_SERIESHUB_TV=""
+STYLE_TARGET_LIVEHUB_TV=""
+STYLE_TARGET_DEFAULT=""
+
+RUN_LIB_DIR="$SCRIPT_DIR/run_lib"
+for _module in core.sh backlog.sh firebase.sh build.sh; do
+  _module_path="$RUN_LIB_DIR/$_module"
+  if [[ ! -f "$_module_path" ]]; then
+    printf "Missing required module file: %s\n" "$_module_path" >&2
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  source "$_module_path"
+done
+
+usage() {
+  cat <<'__USAGE__'
+Usage: ./run [options]
+
+Options:
+  --branch <name>     Override DEPLOY_GIT_BRANCH
+  --interval <sec>    Override CHECK_INTERVAL_SECONDS (default 300)
+  --force, --force-build
+                      Build/distribute all apps immediately using one merged Gradle invocation
+  --force-tv          Build immediately from latest configured branch and distribute TV apps only
+  --force-mobile      Build immediately from latest configured branch and distribute mobile apps only
+  --once              Run one check/build cycle then exit
+  --dry-run           Print planned actions without real build/distribute
+  --print-config      Print effective configuration
+  -h, --help          Show help
+__USAGE__
+}
+
+
+print_config() {
+  cat <<__CONFIG__
+Effective configuration:
+  ANDROID_REPO_PATH=$ANDROID_REPO_PATH
+  DEPLOY_GIT_BRANCH=$DEPLOY_GIT_BRANCH
+  GIT_REMOTE_NAME=$GIT_REMOTE_NAME
+  CHECK_INTERVAL_SECONDS=$CHECK_INTERVAL_SECONDS
+  BUILD_COMMAND_TV=${BUILD_COMMAND_TV:-}
+  BUILD_COMMAND_MOBILE=${BUILD_COMMAND_MOBILE:-}
+  EFFECTIVE_BUILD_COMMAND_TV=${EFFECTIVE_BUILD_COMMAND_TV:-}
+  EFFECTIVE_BUILD_COMMAND_MOBILE=${EFFECTIVE_BUILD_COMMAND_MOBILE:-}
+  MAX_MERGE_COMMITS_SCAN=$MAX_MERGE_COMMITS_SCAN
+  MOBILE_APK_OUTPUT_DIR=$MOBILE_APK_OUTPUT_DIR
+  TV_APK_OUTPUT_DIR=$TV_APK_OUTPUT_DIR
+  FAIL_IF_APK_NOT_FOUND=$FAIL_IF_APK_NOT_FOUND
+  ALLOW_STALE_APK_FALLBACK=$ALLOW_STALE_APK_FALLBACK
+  ENABLE_DISTRIBUTION=$ENABLE_DISTRIBUTION
+  ENABLE_MOBILE_DISTRIBUTION=$ENABLE_MOBILE_DISTRIBUTION
+  ENABLE_VIDEOHUB_TV_DISTRIBUTION=$ENABLE_VIDEOHUB_TV_DISTRIBUTION
+  ENABLE_SERIESHUB_TV_DISTRIBUTION=$ENABLE_SERIESHUB_TV_DISTRIBUTION
+  ENABLE_LIVEHUB_TV_DISTRIBUTION=$ENABLE_LIVEHUB_TV_DISTRIBUTION
+  FIREBASE_PROJECT_ID=$FIREBASE_PROJECT_ID
+  FIREBASE_CLI_BIN=$FIREBASE_CLI_BIN
+  FIREBASE_APP_ID_VIDEOHUB_MOBILE=$FIREBASE_APP_ID_VIDEOHUB_MOBILE
+  FIREBASE_APP_ID_VIDEOHUB_TV=$FIREBASE_APP_ID_VIDEOHUB_TV
+  FIREBASE_APP_ID_SERIESHUB_TV=$FIREBASE_APP_ID_SERIESHUB_TV
+  FIREBASE_APP_ID_LIVEHUB_TV=$FIREBASE_APP_ID_LIVEHUB_TV
+  FIREBASE_TARGET_APP_MAP=$FIREBASE_TARGET_APP_MAP
+  FIREBASE_TARGET_GROUPS_MAP=$FIREBASE_TARGET_GROUPS_MAP
+  FIREBASE_TARGET_TESTERS_MAP=$FIREBASE_TARGET_TESTERS_MAP
+  FIREBASE_DISTRIBUTION_GROUP_ALIAS=$FIREBASE_DISTRIBUTION_GROUP_ALIAS
+  FIREBASE_DISTRIBUTION_GROUP_NAME=$FIREBASE_DISTRIBUTION_GROUP_NAME
+  FIREBASE_GROUPS_MOBILE=$FIREBASE_GROUPS_MOBILE
+  FIREBASE_GROUPS_VIDEOHUB_TV=$FIREBASE_GROUPS_VIDEOHUB_TV
+  FIREBASE_GROUPS_SERIESHUB_TV=$FIREBASE_GROUPS_SERIESHUB_TV
+  FIREBASE_GROUPS_LIVEHUB_TV=$FIREBASE_GROUPS_LIVEHUB_TV
+  FIREBASE_TESTERS_GLOBAL=$FIREBASE_TESTERS_GLOBAL
+  FIREBASE_TESTERS_MOBILE=$FIREBASE_TESTERS_MOBILE
+  FIREBASE_TESTERS_VIDEOHUB_TV=$FIREBASE_TESTERS_VIDEOHUB_TV
+  FIREBASE_TESTERS_SERIESHUB_TV=$FIREBASE_TESTERS_SERIESHUB_TV
+  FIREBASE_TESTERS_LIVEHUB_TV=$FIREBASE_TESTERS_LIVEHUB_TV
+  FIREBASE_RELEASE_NOTES_FILE=$FIREBASE_RELEASE_NOTES_FILE
+  FIREBASE_RELEASE_NOTES_TEMPLATE_FILE=$FIREBASE_RELEASE_NOTES_TEMPLATE_FILE
+  BACKLOG_TASK_LOOKUP_ENABLED=$BACKLOG_TASK_LOOKUP_ENABLED
+  BACKLOG_SPACE_KEY=$BACKLOG_SPACE_KEY
+  BACKLOG_PROJECT_KEY=$BACKLOG_PROJECT_KEY
+  BACKLOG_CHROME_PROFILE_DIR=$BACKLOG_CHROME_PROFILE_DIR
+  BACKLOG_MANUAL_TASK_PROMPT_ENABLED=$BACKLOG_MANUAL_TASK_PROMPT_ENABLED
+  BACKLOG_MANUAL_TASK_PROMPT_TIMEOUT_SECONDS=$BACKLOG_MANUAL_TASK_PROMPT_TIMEOUT_SECONDS
+  BACKLOG_NOTES_JOB_WAIT_SECONDS=$BACKLOG_NOTES_JOB_WAIT_SECONDS
+  FIREBASE_AUTH_MODE=$FIREBASE_AUTH_MODE
+  GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
+  FIREBASE_TOKEN=$(mask_secret "${FIREBASE_TOKEN:-}")
+  STATE_FILE=$STATE_FILE
+  FORCE_BUILD=$FORCE_BUILD
+  FORCE_BUILD_SCOPE=$FORCE_BUILD_SCOPE
+  RUN_ONCE=$RUN_ONCE
+  DRY_RUN=$DRY_RUN
+__CONFIG__
+}
+
+
+run() {
+  trap on_signal INT TERM
+
+  setup_terminal_styles
+  parse_arguments "$@"
+
+  [[ -f "$LOCAL_CONFIG_FILE" ]] || die "Missing .env file at $LOCAL_CONFIG_FILE."
+  load_env_file "$LOCAL_CONFIG_FILE"
+  log "Loaded configuration from $LOCAL_CONFIG_FILE"
+  apply_legacy_env_compat
+
+  if [[ -n "$CLI_BRANCH" ]]; then
+    DEPLOY_GIT_BRANCH="$CLI_BRANCH"
+  fi
+
+  if [[ -n "$CLI_INTERVAL" ]]; then
+    CHECK_INTERVAL_SECONDS="$CLI_INTERVAL"
+  fi
+
+  : "${DEPLOY_GIT_BRANCH:?Missing DEPLOY_GIT_BRANCH in .env}"
+  : "${GIT_REMOTE_NAME:?Missing GIT_REMOTE_NAME in .env}"
+  : "${CHECK_INTERVAL_SECONDS:?Missing CHECK_INTERVAL_SECONDS in .env}"
+  : "${ANDROID_REPO_PATH:?Missing ANDROID_REPO_PATH in .env}"
+  : "${STATE_DIR:?Missing STATE_DIR in .env}"
+  : "${MOBILE_APK_OUTPUT_DIR:?Missing MOBILE_APK_OUTPUT_DIR in .env}"
+  : "${TV_APK_OUTPUT_DIR:?Missing TV_APK_OUTPUT_DIR in .env}"
+  : "${FAIL_IF_APK_NOT_FOUND:?Missing FAIL_IF_APK_NOT_FOUND in .env}"
+  : "${ALLOW_STALE_APK_FALLBACK:?Missing ALLOW_STALE_APK_FALLBACK in .env}"
+  : "${MAX_MERGE_COMMITS_SCAN:=20}"
+
+  : "${ENABLE_DISTRIBUTION:=true}"
+  : "${ENABLE_MOBILE_DISTRIBUTION:=true}"
+  : "${ENABLE_VIDEOHUB_TV_DISTRIBUTION:=true}"
+  : "${ENABLE_SERIESHUB_TV_DISTRIBUTION:=true}"
+  : "${ENABLE_LIVEHUB_TV_DISTRIBUTION:=true}"
+
+  : "${FIREBASE_PROJECT_ID:=ottclouds-template-dev-22980}"
+  : "${FIREBASE_CLI_BIN:=firebase}"
+
+  # Auto-filled from Firebase project ottclouds-template-dev-22980.
+  : "${FIREBASE_APP_ID_VIDEOHUB_MOBILE:=1:1029892934873:android:9ef09d394abd1773df42c8}"
+  : "${FIREBASE_APP_ID_VIDEOHUB_TV:=1:1029892934873:android:c8719fc8334c15e7df42c8}"
+  : "${FIREBASE_APP_ID_SERIESHUB_TV:=1:1029892934873:android:8a1c93a5967b1bfbdf42c8}"
+  : "${FIREBASE_APP_ID_LIVEHUB_TV:=1:1029892934873:android:f3e33592987377f8df42c8}"
+  : "${FIREBASE_TARGET_APP_MAP:=}"
+  : "${FIREBASE_TARGET_GROUPS_MAP:=}"
+  : "${FIREBASE_TARGET_TESTERS_MAP:=}"
+
+  : "${FIREBASE_DISTRIBUTION_GROUP_ALIAS:=ottclouds-template}"
+  : "${FIREBASE_DISTRIBUTION_GROUP_NAME:=OTTClouds Template}"
+  : "${FIREBASE_GROUPS_MOBILE:=}"
+  : "${FIREBASE_GROUPS_VIDEOHUB_TV:=}"
+  : "${FIREBASE_GROUPS_SERIESHUB_TV:=}"
+  : "${FIREBASE_GROUPS_LIVEHUB_TV:=}"
+
+  : "${FIREBASE_TESTERS_GLOBAL:=}"
+  : "${FIREBASE_TESTERS_MOBILE:=}"
+  : "${FIREBASE_TESTERS_VIDEOHUB_TV:=}"
+  : "${FIREBASE_TESTERS_SERIESHUB_TV:=}"
+  : "${FIREBASE_TESTERS_LIVEHUB_TV:=}"
+
+  : "${FIREBASE_RELEASE_NOTES:=}"
+  : "${FIREBASE_RELEASE_NOTES_FILE:=}"
+  : "${FIREBASE_RELEASE_NOTES_TEMPLATE_FILE:=../release_notes_sample.txt}"
+  : "${BACKLOG_TASK_LOOKUP_ENABLED:=true}"
+  : "${BACKLOG_SPACE_KEY:=stvn}"
+  : "${BACKLOG_PROJECT_KEY:=OTT_TPL}"
+  : "${BACKLOG_CHROME_PROFILE_DIR:=$HOME/Library/Application Support/Google/Chrome/Profile 1}"
+  : "${BACKLOG_MANUAL_TASK_PROMPT_ENABLED:=true}"
+  : "${BACKLOG_MANUAL_TASK_PROMPT_TIMEOUT_SECONDS:=180}"
+  : "${BACKLOG_NOTES_JOB_WAIT_SECONDS:=0}"
+  : "${FIREBASE_TOKEN:=}"
+  : "${GOOGLE_APPLICATION_CREDENTIALS:=}"
+
+  normalize_distribution_group_alias
+
+  [[ "$CHECK_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || die "CHECK_INTERVAL_SECONDS must be an integer"
+  [[ "$CHECK_INTERVAL_SECONDS" -gt 0 ]] || die "CHECK_INTERVAL_SECONDS must be greater than 0"
+  [[ "$MAX_MERGE_COMMITS_SCAN" =~ ^[0-9]+$ ]] || die "MAX_MERGE_COMMITS_SCAN must be an integer"
+  [[ "$MAX_MERGE_COMMITS_SCAN" -gt 0 ]] || die "MAX_MERGE_COMMITS_SCAN must be greater than 0"
+  [[ "$BACKLOG_MANUAL_TASK_PROMPT_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "BACKLOG_MANUAL_TASK_PROMPT_TIMEOUT_SECONDS must be a non-negative integer"
+  [[ "$BACKLOG_NOTES_JOB_WAIT_SECONDS" =~ ^[0-9]+$ ]] || die "BACKLOG_NOTES_JOB_WAIT_SECONDS must be a non-negative integer"
+
+  ANDROID_REPO_PATH="$(resolve_path "$ANDROID_REPO_PATH" "$CONFIG_BASE_DIR")"
+  STATE_DIR="$(resolve_path "$STATE_DIR" "$CONFIG_BASE_DIR")"
+  mkdir -p "$STATE_DIR"
+  EFFECTIVE_BUILD_COMMAND_TV="$(normalize_build_command "${BUILD_COMMAND_TV:-}")"
+  EFFECTIVE_BUILD_COMMAND_TV="$(trim_value "$EFFECTIVE_BUILD_COMMAND_TV")"
+
+  EFFECTIVE_BUILD_COMMAND_MOBILE="$(normalize_build_command "${BUILD_COMMAND_MOBILE:-}")"
+  EFFECTIVE_BUILD_COMMAND_MOBILE="$(trim_value "$EFFECTIVE_BUILD_COMMAND_MOBILE")"
+
+  STATE_FILE="$STATE_DIR/${DEPLOY_GIT_BRANCH//\//_}.state"
+
+  [[ -d "$ANDROID_REPO_PATH/.git" ]] || die "ANDROID_REPO_PATH is not a git repo: $ANDROID_REPO_PATH"
+
+  require_command git
+  require_command find
+  ensure_java_runtime
+  if is_truthy "$ENABLE_DISTRIBUTION"; then
+    require_command jq
+  fi
+
+  setup_firebase_auth
+
+  if ! is_truthy "$DRY_RUN" && is_truthy "$ENABLE_DISTRIBUTION"; then
+    require_command "$FIREBASE_CLI_BIN"
+    firebase_auth_preflight
+  fi
+
+  if is_truthy "$PRINT_CONFIG"; then
+    print_config
+  fi
+
+  log "Branch listener started: $GIT_REMOTE_NAME/$DEPLOY_GIT_BRANCH"
+  log "Check interval: ${CHECK_INTERVAL_SECONDS}s"
+
+  local force_next_cycle="$FORCE_BUILD"
+  while true; do
+    if is_truthy "$SHUTDOWN_REQUESTED"; then
+      log "Shutdown completed. Exiting listener."
+      break
+    fi
+
+    if run_single_cycle "$force_next_cycle"; then
+      force_next_cycle="false"
+    else
+      local cycle_status=$?
+      if [[ "$cycle_status" -eq 130 ]]; then
+        log "Listener stopped by signal."
+        break
+      fi
+      warn "Cycle ended with error code $cycle_status"
+      force_next_cycle="false"
+      if is_truthy "$RUN_ONCE"; then
+        exit "$cycle_status"
+      fi
+    fi
+
+    if is_truthy "$RUN_ONCE"; then
+      log "Run-once mode completed."
+      break
+    fi
+
+    if is_truthy "$LAST_CYCLE_DID_BUILD" && ! is_truthy "$DRY_RUN"; then
+      log "Build finished. Checking branch again immediately..."
+      continue
+    fi
+
+    log "Waiting ${CHECK_INTERVAL_SECONDS}s before next check..."
+    sleep "$CHECK_INTERVAL_SECONDS"
+  done
+}
+
+run "$@"
