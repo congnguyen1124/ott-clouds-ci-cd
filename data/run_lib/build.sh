@@ -283,7 +283,18 @@ run_single_cycle() {
     fi
 
     local selected_effective_build_command=""
-    if [[ "$should_build_tv" == "true" ]]; then
+    if [[ "$should_build_tv" == "true" && "$should_build_mobile" == "true" ]]; then
+      [[ -n "$EFFECTIVE_BUILD_COMMAND_TV" ]] || die "BUILD_COMMAND_TV is empty. Please set BUILD_COMMAND_TV in .env."
+      [[ -n "$EFFECTIVE_BUILD_COMMAND_MOBILE" ]] || die "BUILD_COMMAND_MOBILE is empty. Please set BUILD_COMMAND_MOBILE in .env."
+      selected_effective_build_command="$(merge_build_commands_single_gradlew "$EFFECTIVE_BUILD_COMMAND_TV" "$EFFECTIVE_BUILD_COMMAND_MOBILE")"
+      selected_effective_build_command="$(trim_value "$selected_effective_build_command")"
+      [[ -n "$selected_effective_build_command" ]] || die "Cannot merge BUILD_COMMAND_TV and BUILD_COMMAND_MOBILE for current cycle."
+      if is_truthy "$force_this_cycle"; then
+        log "Force mode merged TV + mobile tasks into one Gradle command."
+      else
+        log "Detected both app-tv and app-mobile in merge context. Merged TV + mobile tasks into one Gradle command."
+      fi
+    elif [[ "$should_build_tv" == "true" ]]; then
       [[ -n "$EFFECTIVE_BUILD_COMMAND_TV" ]] || die "BUILD_COMMAND_TV is empty. Please set BUILD_COMMAND_TV in .env."
       selected_effective_build_command="$EFFECTIVE_BUILD_COMMAND_TV"
       if is_truthy "$force_this_cycle"; then
@@ -291,26 +302,14 @@ run_single_cycle() {
       else
         log "Trigger TV build due to merged branch keyword 'app-tv'."
       fi
-    fi
-    if [[ "$should_build_mobile" == "true" ]]; then
+    elif [[ "$should_build_mobile" == "true" ]]; then
       [[ -n "$EFFECTIVE_BUILD_COMMAND_MOBILE" ]] || die "BUILD_COMMAND_MOBILE is empty. Please set BUILD_COMMAND_MOBILE in .env."
-      if [[ -n "$selected_effective_build_command" ]]; then
-        selected_effective_build_command="$selected_effective_build_command && $EFFECTIVE_BUILD_COMMAND_MOBILE"
-      else
-        selected_effective_build_command="$EFFECTIVE_BUILD_COMMAND_MOBILE"
-      fi
+      selected_effective_build_command="$EFFECTIVE_BUILD_COMMAND_MOBILE"
       if is_truthy "$force_this_cycle"; then
         log "Trigger mobile build in force mode."
       else
         log "Trigger mobile build due to merged branch keyword 'app-mobile'."
       fi
-    fi
-
-    if is_truthy "$force_this_cycle" && [[ "$should_build_tv" == "true" && "$should_build_mobile" == "true" ]]; then
-      selected_effective_build_command="$(merge_build_commands_single_gradlew "$EFFECTIVE_BUILD_COMMAND_TV" "$EFFECTIVE_BUILD_COMMAND_MOBILE")"
-      selected_effective_build_command="$(trim_value "$selected_effective_build_command")"
-      [[ -n "$selected_effective_build_command" ]] || die "Cannot merge BUILD_COMMAND_TV and BUILD_COMMAND_MOBILE for force mode."
-      log "Force mode merged TV + mobile tasks into one Gradle command."
     fi
 
     [[ -n "$selected_effective_build_command" ]] || die "No effective build command selected for current cycle."
